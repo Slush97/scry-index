@@ -31,7 +31,6 @@ impl LinearModel {
     #[inline]
     pub fn predict<K: Key>(&self, key: K, array_size: usize) -> usize {
         let pos = self.slope.mul_add(key.to_model_input(), self.intercept);
-        // Clamp to valid range
         let pos = pos.round().max(0.0) as usize;
         pos.min(array_size.saturating_sub(1))
     }
@@ -91,8 +90,6 @@ pub fn fit_fmcd<K: Key>(keys: &[K], expansion_factor: f64) -> FmcdResult {
 
     let array_size = (n as f64 * expansion_factor).ceil().max(n as f64) as usize;
 
-    // Compute the ideal mapping: key_i should map to position i * (array_size-1) / (n-1).
-    // We fit a linear model through the key-to-position mapping.
     let first = keys[0].to_model_input();
     let last = keys[n - 1].to_model_input();
     let key_range = last - first;
@@ -109,8 +106,15 @@ pub fn fit_fmcd<K: Key>(keys: &[K], expansion_factor: f64) -> FmcdResult {
 
     let model = LinearModel::new(slope, intercept);
 
-    // Count conflicts: how many keys map to the same slot
-    let conflicts = count_conflicts(keys, &model, array_size);
+    // Fast path: for sorted keys with expansion >= 2.0 and uniform-ish spacing,
+    // conflicts are rare. Check monotonicity of predictions first — if each key
+    // maps to a strictly increasing slot, there are zero conflicts without needing
+    // the full O(array_size) allocation for conflict counting.
+    let conflicts = if expansion_factor >= 1.5 && n > 2 {
+        count_conflicts_fast(keys, &model, array_size)
+    } else {
+        count_conflicts(keys, &model, array_size)
+    };
 
     FmcdResult {
         model,
@@ -119,7 +123,27 @@ pub fn fit_fmcd<K: Key>(keys: &[K], expansion_factor: f64) -> FmcdResult {
     }
 }
 
+/// Fast conflict counting for sorted keys.
+///
+/// Since keys are sorted and the model is monotonic, we only need to check
+/// if adjacent keys map to the same slot (no allocation needed).
+fn count_conflicts_fast<K: Key>(keys: &[K], model: &LinearModel, array_size: usize) -> usize {
+    let mut conflicts = 0;
+    let mut prev_slot = model.predict(keys[0], array_size);
+    for &key in &keys[1..] {
+        let slot = model.predict(key, array_size);
+        if slot == prev_slot {
+            conflicts += 1;
+        }
+        prev_slot = slot;
+    }
+    conflicts
+}
+
 /// Count how many keys collide (map to the same slot).
+///
+/// Full version: allocates a boolean array. Needed when keys are not sorted
+/// or expansion factor is very tight.
 fn count_conflicts<K: Key>(keys: &[K], model: &LinearModel, array_size: usize) -> usize {
     let mut occupied = vec![false; array_size];
     let mut conflicts = 0;
@@ -151,7 +175,6 @@ mod tests {
         let result = fit_fmcd(&[10u64, 20], 2.0);
         assert_eq!(result.conflicts, 0);
         assert!(result.array_size >= 2);
-        // Keys should map to different slots
         let s1 = result.model.predict(10u64, result.array_size);
         let s2 = result.model.predict(20u64, result.array_size);
         assert_ne!(s1, s2, "two keys should map to different slots");
@@ -169,19 +192,15 @@ mod tests {
 
     #[test]
     fn dense_keys_some_conflicts() {
-        // With expansion_factor = 1.0, conflicts are likely for non-uniform keys
         let keys: Vec<u64> = vec![1, 2, 3, 100, 200, 300];
         let result = fit_fmcd(&keys, 1.0);
-        // We just verify it doesn't panic; conflicts depend on distribution
         assert!(result.array_size >= keys.len());
     }
 
     #[test]
     fn predict_clamps_to_range() {
         let model = LinearModel::new(1.0, -10.0);
-        // Negative prediction should clamp to 0
         assert_eq!(model.predict(5u64, 100), 0);
-        // Large prediction should clamp to array_size - 1
         let model2 = LinearModel::new(1.0, 1000.0);
         assert_eq!(model2.predict(5u64, 100), 99);
     }
@@ -196,10 +215,8 @@ mod tests {
 
     #[test]
     fn identical_keys_handled() {
-        // All same keys — should not panic
         let keys = vec![5u64; 10];
         let result = fit_fmcd(&keys, 2.0);
-        // All map to same slot, so conflicts = n - 1
         assert_eq!(result.conflicts, 9);
     }
 
@@ -237,7 +254,6 @@ mod tests {
             .iter()
             .map(|&k| result.model.predict(k, result.array_size))
             .collect();
-        // Positions should be non-decreasing for sorted keys
         for pair in positions.windows(2) {
             assert!(
                 pair[0] <= pair[1],
@@ -246,5 +262,24 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    #[test]
+    fn fast_and_full_conflict_count_agree() {
+        // Non-uniform keys where conflicts are likely with tight expansion
+        let keys: Vec<u64> = vec![1, 2, 3, 4, 5, 100, 200, 300, 400, 500];
+        let array_size = 15;
+        let first = keys[0].to_model_input();
+        let last = keys[keys.len() - 1].to_model_input();
+        let slope = (array_size - 1) as f64 / (last - first);
+        let intercept = -slope * first;
+        let model = LinearModel::new(slope, intercept);
+
+        let fast = count_conflicts_fast(&keys, &model, array_size);
+        let full = count_conflicts(&keys, &model, array_size);
+        assert_eq!(
+            fast, full,
+            "fast ({fast}) and full ({full}) conflict counts disagree"
+        );
     }
 }

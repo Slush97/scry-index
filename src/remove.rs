@@ -71,7 +71,7 @@ mod tests {
         remove(&mut node, &10);
         assert_eq!(crate::lookup::get(&node, &10), None);
 
-        crate::insert::insert(&mut node, 10, "A", &Config::default());
+        crate::insert::insert(&mut node, 10, "A");
         assert_eq!(crate::lookup::get(&node, &10), Some(&"A"));
     }
 

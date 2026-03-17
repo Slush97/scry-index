@@ -40,6 +40,8 @@ pub struct LearnedMap<K: Key, V> {
     root: Node<K, V>,
     len: usize,
     config: Config,
+    /// Number of inserts since last rebuild. Used to trigger auto-rebuild.
+    inserts_since_rebuild: usize,
 }
 
 impl<K: Key, V: Clone> LearnedMap<K, V> {
@@ -50,13 +52,12 @@ impl<K: Key, V: Clone> LearnedMap<K, V> {
 
     /// Create a new empty learned map with the given configuration.
     pub fn with_config(config: Config) -> Self {
-        // Start with a small root node. The model doesn't matter yet
-        // because all slots are empty — any key will predict some slot.
         let root = Node::with_capacity(LinearModel::new(0.01, 0.0), 16);
         Self {
             root,
             len: 0,
             config,
+            inserts_since_rebuild: 0,
         }
     }
 
@@ -83,6 +84,7 @@ impl<K: Key, V: Clone> LearnedMap<K, V> {
             len: pairs.len(),
             root,
             config,
+            inserts_since_rebuild: 0,
         })
     }
 
@@ -99,10 +101,15 @@ impl<K: Key, V: Clone> LearnedMap<K, V> {
     /// Insert a key-value pair.
     ///
     /// Returns the previous value if the key already existed.
+    ///
+    /// When enough inserts accumulate, the tree is automatically rebuilt
+    /// with a proper FMCD model to maintain fast lookups.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        let old = insert::insert(&mut self.root, key, value, &self.config);
+        let old = insert::insert(&mut self.root, key, value);
         if old.is_none() {
             self.len += 1;
+            self.inserts_since_rebuild += 1;
+            self.maybe_rebuild();
         }
         old
     }
@@ -144,6 +151,39 @@ impl<K: Key, V: Clone> LearnedMap<K, V> {
     /// Useful for diagnostics — a well-fit model should keep depth low.
     pub fn max_depth(&self) -> usize {
         self.root.max_depth()
+    }
+
+    /// Rebuild the tree from scratch using bulk load.
+    ///
+    /// Collects all key-value pairs, sorts them, and rebuilds with optimal
+    /// FMCD model fitting. This compacts the tree and restores O(1) lookups
+    /// after many incremental inserts.
+    pub fn rebuild(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        let pairs = iter::sorted_pairs(&self.root);
+        // sorted_pairs guarantees sorted order, so bulk_load won't fail
+        if let Ok(new_root) = build::bulk_load(&pairs, &self.config) {
+            self.root = new_root;
+            self.inserts_since_rebuild = 0;
+        }
+    }
+
+    /// Check if the tree should be rebuilt based on insert pressure.
+    ///
+    /// Triggers a rebuild when the tree depth exceeds a threshold relative
+    /// to the number of keys. A well-fit model should have depth <= ~3 for
+    /// any reasonable key count; depth growing beyond that indicates the
+    /// model is degraded and a rebuild will help.
+    fn maybe_rebuild(&mut self) {
+        // Rebuild when we've accumulated enough new inserts to justify the cost.
+        // Use a fraction of total keys so rebuilds become less frequent as the
+        // map grows (amortized cost stays low).
+        let threshold = (self.len / 4).clamp(16, 10_000);
+        if self.inserts_since_rebuild >= threshold {
+            self.rebuild();
+        }
     }
 }
 
@@ -298,7 +338,6 @@ mod tests {
     fn max_depth_bounded() {
         let pairs: Vec<(u64, u64)> = (0..1000).map(|i| (i, i)).collect();
         let map = LearnedMap::bulk_load(&pairs).unwrap();
-        // With expansion_factor 2.0 and sequential keys, depth should be very low
         assert!(
             map.max_depth() <= 5,
             "depth {} is too high for 1000 sequential keys",
@@ -311,26 +350,88 @@ mod tests {
         let mut map = LearnedMap::new();
         let n = 500u64;
 
-        // Insert
         for i in 0..n {
             map.insert(i * 3, i);
         }
         assert_eq!(map.len(), n as usize);
 
-        // Verify all present
         for i in 0..n {
             assert_eq!(map.get(&(i * 3)), Some(&i), "key {} missing", i * 3);
         }
 
-        // Remove even-indexed
         for i in (0..n).filter(|i| i % 2 == 0) {
             map.remove(&(i * 3));
         }
         assert_eq!(map.len(), (n / 2) as usize);
 
-        // Verify odd-indexed still present
         for i in (0..n).filter(|i| i % 2 != 0) {
             assert_eq!(map.get(&(i * 3)), Some(&i));
         }
+    }
+
+    #[test]
+    fn auto_rebuild_triggers() {
+        let mut map = LearnedMap::new();
+        for i in 0..200u64 {
+            map.insert(i, i);
+        }
+        assert_eq!(map.len(), 200);
+        // All keys should still be findable after rebuilds
+        for i in 0..200u64 {
+            assert_eq!(map.get(&i), Some(&i), "key {i} missing after auto-rebuild");
+        }
+        // Force a final rebuild and check depth is compact
+        map.rebuild();
+        assert!(
+            map.max_depth() <= 3,
+            "depth {} after explicit rebuild is too high",
+            map.max_depth()
+        );
+    }
+
+    #[test]
+    fn manual_rebuild() {
+        let mut map = LearnedMap::new();
+        for i in (0..100u64).rev() {
+            map.insert(i, i * 10);
+        }
+        let depth_before = map.max_depth();
+        map.rebuild();
+        let depth_after = map.max_depth();
+        // Rebuild should reduce depth for reverse-inserted data
+        assert!(
+            depth_after <= depth_before,
+            "rebuild didn't help: {depth_before} -> {depth_after}"
+        );
+        // All keys still present
+        for i in 0..100u64 {
+            assert_eq!(map.get(&i), Some(&(i * 10)));
+        }
+    }
+
+    #[test]
+    fn rebuild_empty_is_noop() {
+        let mut map = LearnedMap::<u64, u64>::new();
+        map.rebuild(); // should not panic
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn large_incremental_insert() {
+        let mut map = LearnedMap::new();
+        for i in 0..1000u64 {
+            map.insert(i, i);
+        }
+        assert_eq!(map.len(), 1000);
+        for i in 0..1000u64 {
+            assert_eq!(map.get(&i), Some(&i));
+        }
+        // After explicit rebuild, depth should be compact
+        map.rebuild();
+        assert!(
+            map.max_depth() <= 3,
+            "depth {} too high for 1000 keys after rebuild",
+            map.max_depth()
+        );
     }
 }

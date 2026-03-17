@@ -116,8 +116,8 @@ mod tests {
         let pairs: Vec<(u64, u64)> = vec![(10, 1), (30, 3), (50, 5)];
         let mut node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
 
-        crate::insert::insert(&mut node, 20, 2, &Config::default());
-        crate::insert::insert(&mut node, 40, 4, &Config::default());
+        crate::insert::insert(&mut node, 20, 2);
+        crate::insert::insert(&mut node, 40, 4);
 
         let sorted = sorted_pairs(&node);
         assert_eq!(sorted.len(), 5);
