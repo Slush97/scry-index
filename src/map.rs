@@ -535,8 +535,7 @@ mod tests {
 
     #[test]
     fn from_iterator() {
-        let map: LearnedMap<u64, &str> =
-            vec![(1, "a"), (2, "b"), (3, "c")].into_iter().collect();
+        let map: LearnedMap<u64, &str> = vec![(1, "a"), (2, "b"), (3, "c")].into_iter().collect();
         let g = map.guard();
         assert_eq!(map.len(), 3);
         assert_eq!(map.get(&2, &g), Some(&"b"));

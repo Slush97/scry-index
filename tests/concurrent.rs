@@ -418,11 +418,7 @@ fn rebuild_with_concurrent_readers() {
     // After rebuild, all keys should still be present
     let guard = map.guard();
     for i in 0..5000u64 {
-        assert_eq!(
-            map.get(&i, &guard),
-            Some(&i),
-            "key {i} lost after rebuild"
-        );
+        assert_eq!(map.get(&i, &guard), Some(&i), "key {i} lost after rebuild");
     }
 }
 
@@ -471,7 +467,10 @@ fn global_rebuild_lockfree() {
     // Lock-free rebuild may race with inserts: verify no corruption.
     let guard = map.guard();
     let actual = map.iter_sorted(&guard).len();
-    assert!(actual <= 3000, "actual count {actual} exceeds total inserts");
+    assert!(
+        actual <= 3000,
+        "actual count {actual} exceeds total inserts"
+    );
 
     // Map must be usable: re-insert all keys, rebuild, verify all present.
     for i in 0..3000u64 {
@@ -481,10 +480,7 @@ fn global_rebuild_lockfree() {
     let g2 = map.guard();
     assert_eq!(map.len(), 3000);
     for i in 0..3000u64 {
-        assert!(
-            map.get(&i, &g2).is_some(),
-            "key {i} missing after recovery"
-        );
+        assert!(map.get(&i, &g2).is_some(), "key {i} missing after recovery");
     }
 }
 
@@ -498,7 +494,9 @@ fn global_rebuild_lockfree() {
 fn rebuild_with_concurrent_removes_no_corruption() {
     // Pre-populate 2000 keys
     let pairs: Vec<(u64, u64)> = (0..2000).map(|i| (i, i)).collect();
-    let map = Arc::new(LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap());
+    let map = Arc::new(
+        LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap(),
+    );
     let barrier = Arc::new(Barrier::new(3));
 
     // 2 remover threads, each removing half the even keys
@@ -544,7 +542,10 @@ fn rebuild_with_concurrent_removes_no_corruption() {
     }
     // Map should be internally consistent
     let actual = map.iter_sorted(&guard).len();
-    assert!(actual >= 1000, "at least 1000 odd keys should be present, got {actual}");
+    assert!(
+        actual >= 1000,
+        "at least 1000 odd keys should be present, got {actual}"
+    );
 }
 
 /// Auto-rebuild (localized subtree rebuilds) under concurrency.
@@ -599,10 +600,7 @@ fn auto_rebuild_concurrent_no_corruption() {
     let g2 = map.guard();
     assert_eq!(map.len(), 8000);
     for i in 0..8000u64 {
-        assert!(
-            map.get(&i, &g2).is_some(),
-            "key {i} missing after recovery"
-        );
+        assert!(map.get(&i, &g2).is_some(), "key {i} missing after recovery");
     }
 }
 
@@ -704,7 +702,9 @@ fn auto_rebuild_disabled_depth_grows() {
 #[test]
 fn concurrent_range_during_inserts() {
     let pairs: Vec<(u64, u64)> = (0..1000).map(|i| (i * 2, i)).collect();
-    let map = Arc::new(LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap());
+    let map = Arc::new(
+        LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap(),
+    );
     let barrier = Arc::new(Barrier::new(6));
 
     // 4 writer threads insert odd keys
@@ -789,12 +789,7 @@ fn concurrent_first_last_during_inserts() {
                     if let (Some(first), Some(last)) =
                         (map.first_key_value(&guard), map.last_key_value(&guard))
                     {
-                        assert!(
-                            first.0 <= last.0,
-                            "first ({}) > last ({})",
-                            first.0,
-                            last.0
-                        );
+                        assert!(first.0 <= last.0, "first ({}) > last ({})", first.0, last.0);
                     }
                 }
             })

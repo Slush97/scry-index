@@ -223,10 +223,7 @@ pub fn first_entry<'g, K: Key, V>(
 ///
 /// Scans slots right-to-left at each level, following the rightmost non-empty
 /// slot. Returns `None` if the tree is empty. O(depth) typical.
-pub fn last_entry<'g, K: Key, V>(
-    root: &'g Node<K, V>,
-    guard: &'g Guard,
-) -> Option<(&'g K, &'g V)> {
+pub fn last_entry<'g, K: Key, V>(root: &'g Node<K, V>, guard: &'g Guard) -> Option<(&'g K, &'g V)> {
     let mut node = root;
     loop {
         let mut child_found = None;
@@ -359,10 +356,7 @@ mod tests {
     #[test]
     fn iter_raw_is_sorted_reverse_inserts() {
         let g = guard();
-        let node = Node::<u64, u64>::with_capacity(
-            crate::model::LinearModel::new(0.01, 0.0),
-            16,
-        );
+        let node = Node::<u64, u64>::with_capacity(crate::model::LinearModel::new(0.01, 0.0), 16);
         for i in (0..200u64).rev() {
             crate::insert::insert(&node, i, &i, &Config::default(), &g);
         }

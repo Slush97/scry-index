@@ -41,7 +41,13 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
         // No conflicts — place each key-value directly in its predicted slot
         for (key, value) in pairs {
             let slot = node.predict_slot(*key);
-            node.store_slot(slot, SlotInner::Data { key: *key, value: value.clone() });
+            node.store_slot(
+                slot,
+                SlotInner::Data {
+                    key: *key,
+                    value: value.clone(),
+                },
+            );
             node.inc_keys();
         }
     } else {
@@ -65,14 +71,22 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
             let run = &assignments[start..i];
             if run.len() == 1 {
                 let (k, v) = &pairs[run[0].1];
-                node.store_slot(slot_idx, SlotInner::Data { key: *k, value: v.clone() });
+                node.store_slot(
+                    slot_idx,
+                    SlotInner::Data {
+                        key: *k,
+                        value: v.clone(),
+                    },
+                );
                 node.inc_keys();
             } else {
-                let child_pairs: Vec<(K, V)> =
-                    run.iter().map(|&(_, idx)| {
+                let child_pairs: Vec<(K, V)> = run
+                    .iter()
+                    .map(|&(_, idx)| {
                         let (k, v) = &pairs[idx];
                         (*k, v.clone())
-                    }).collect();
+                    })
+                    .collect();
                 let child = build_recursive(&child_pairs, config);
                 node.store_slot(slot_idx, SlotInner::Child(child));
             }

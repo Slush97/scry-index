@@ -90,9 +90,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                         value: value.clone(),
                     });
                     if slot
-                        .compare_exchange(
-                            current, new, Ordering::AcqRel, Ordering::Acquire, guard,
-                        )
+                        .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire, guard)
                         .is_ok()
                     {
                         // SAFETY: We successfully CAS'd out `current`. No new reader

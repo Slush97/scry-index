@@ -69,7 +69,13 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
     let new_inner = Owned::new(SlotInner::Child(new_node));
 
     // CAS: old child -> new child. On failure, another thread modified this slot.
-    match slot.compare_exchange(current, new_inner, Ordering::AcqRel, Ordering::Acquire, guard) {
+    match slot.compare_exchange(
+        current,
+        new_inner,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        guard,
+    ) {
         Ok(_) => {
             // SAFETY: CAS succeeded; old subtree is unreachable to new readers.
             unsafe {
@@ -117,7 +123,10 @@ mod tests {
         }
 
         let depth_before = root.max_depth(&g);
-        assert!(depth_before > 2, "setup should create depth > 2, got {depth_before}");
+        assert!(
+            depth_before > 2,
+            "setup should create depth > 2, got {depth_before}"
+        );
 
         // Find a child slot and rebuild it
         let mut rebuilt = false;

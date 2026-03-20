@@ -49,8 +49,7 @@ impl<K: Key, V> Node<K, V> {
     ///
     /// All slots are initialized to null (empty).
     pub fn with_capacity(model: LinearModel, array_size: usize) -> Self {
-        let slots: Vec<Atomic<SlotInner<K, V>>> =
-            (0..array_size).map(|_| Atomic::null()).collect();
+        let slots: Vec<Atomic<SlotInner<K, V>>> = (0..array_size).map(|_| Atomic::null()).collect();
         Self {
             model,
             slots: slots.into_boxed_slice(),
@@ -200,9 +199,21 @@ mod tests {
         let g = guard();
 
         let child = Node::<u64, &str>::with_capacity(LinearModel::constant(), 3);
-        child.store_slot(0, SlotInner::Data { key: 10, value: "x" });
+        child.store_slot(
+            0,
+            SlotInner::Data {
+                key: 10,
+                value: "x",
+            },
+        );
         child.inc_keys();
-        child.store_slot(1, SlotInner::Data { key: 20, value: "y" });
+        child.store_slot(
+            1,
+            SlotInner::Data {
+                key: 20,
+                value: "y",
+            },
+        );
         child.inc_keys();
 
         let parent = Node::<u64, &str>::with_capacity(LinearModel::constant(), 5);
@@ -235,7 +246,13 @@ mod tests {
     fn store_and_load_slot() {
         let g = guard();
         let node = Node::<u64, i32>::with_capacity(LinearModel::constant(), 4);
-        node.store_slot(1, SlotInner::Data { key: 42, value: 100 });
+        node.store_slot(
+            1,
+            SlotInner::Data {
+                key: 42,
+                value: 100,
+            },
+        );
         node.inc_keys();
 
         let shared = node.slot(1).load(Ordering::Acquire, &g);

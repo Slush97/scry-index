@@ -226,7 +226,11 @@ fn rebuild_preserves_all_data() {
     map.rebuild(&g);
     assert_eq!(map.len(), len_before);
     for i in 0..300u64 {
-        assert_eq!(map.get(&i, &g), Some(&(i * 7)), "key {i} lost after rebuild");
+        assert_eq!(
+            map.get(&i, &g),
+            Some(&(i * 7)),
+            "key {i} lost after rebuild"
+        );
     }
 }
 
@@ -379,7 +383,11 @@ fn stress_1000_random_pattern() {
 
     assert_eq!(map.len(), oracle.len());
     for (&k, &v) in &oracle {
-        assert_eq!(map.get(&k, &g), Some(&v), "mismatch after removal at key {k}");
+        assert_eq!(
+            map.get(&k, &g),
+            Some(&v),
+            "mismatch after removal at key {k}"
+        );
     }
 }
 
@@ -534,7 +542,8 @@ fn range_bounded_matches_btreemap() {
     }
 
     // Test several range bounds
-    let ranges: Vec<std::ops::Range<u64>> = vec![0..100, 1000..5000, 10_000..20_000, 49_000..50_001];
+    let ranges: Vec<std::ops::Range<u64>> =
+        vec![0..100, 1000..5000, 10_000..20_000, 49_000..50_001];
     for r in ranges {
         let map_keys: Vec<u64> = map.range(r.clone(), &g).map(|(k, _)| *k).collect();
         let btree_keys: Vec<u64> = oracle.range(r.clone()).map(|(k, _)| *k).collect();

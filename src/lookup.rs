@@ -109,11 +109,7 @@ mod tests {
         let pairs: Vec<(u64, u64)> = (0..1000).map(|i| (i * 3, i)).collect();
         let tree = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
         for (k, v) in &pairs {
-            assert_eq!(
-                get(&tree, k, &g),
-                Some(v),
-                "key {k} not found in tree"
-            );
+            assert_eq!(get(&tree, k, &g), Some(v), "key {k} not found in tree");
         }
     }
 

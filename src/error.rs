@@ -41,7 +41,10 @@ mod tests {
         assert_eq!(Error::EmptyData.to_string(), "input data is empty");
         assert_eq!(Error::NotSorted.to_string(), "input data is not sorted");
         assert_eq!(
-            Error::InvalidKey { detail: "overflow".into() }.to_string(),
+            Error::InvalidKey {
+                detail: "overflow".into()
+            }
+            .to_string(),
             "invalid key: overflow"
         );
     }
