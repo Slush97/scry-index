@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use scry_index::LearnedMap;
 use std::collections::BTreeMap;
@@ -8,8 +10,9 @@ fn bench_lookup_learned_10k(c: &mut Criterion) {
 
     c.bench_function("learned_get_10k_seq", |b| {
         b.iter(|| {
+            let guard = map.guard();
             for i in 0..10_000u64 {
-                black_box(map.get(&i));
+                black_box(map.get(&i, &guard));
             }
         });
     });
@@ -34,8 +37,9 @@ fn bench_lookup_100k(c: &mut Criterion) {
 
     c.bench_function("learned_get_100k_seq", |b| {
         b.iter(|| {
+            let guard = learned.guard();
             for i in 0..100_000u64 {
-                black_box(learned.get(&i));
+                black_box(learned.get(&i, &guard));
             }
         });
     });
@@ -57,8 +61,9 @@ fn bench_lookup_sparse(c: &mut Criterion) {
 
     c.bench_function("learned_get_10k_sparse", |b| {
         b.iter(|| {
+            let guard = learned.guard();
             for i in 0..10_000u64 {
-                black_box(learned.get(&(i * 1000)));
+                black_box(learned.get(&(i * 1000), &guard));
             }
         });
     });

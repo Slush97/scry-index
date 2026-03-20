@@ -1,0 +1,497 @@
+//! End-to-end integration tests for the scry-index Phase 2 concurrent API.
+
+use scry_index::{Config, Error, LearnedMap, LearnedSet};
+
+// ---------------------------------------------------------------------------
+// LearnedMap: construction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empty_map_has_no_entries() {
+    let map = LearnedMap::<u64, i32>::new();
+    let g = map.guard();
+    assert!(map.is_empty());
+    assert_eq!(map.len(), 0);
+    assert_eq!(map.get(&0, &g), None);
+}
+
+#[test]
+fn bulk_load_rejects_empty() {
+    let result = LearnedMap::<u64, ()>::bulk_load(&[]);
+    assert!(matches!(result, Err(Error::EmptyData)));
+}
+
+#[test]
+fn bulk_load_rejects_unsorted() {
+    let pairs = vec![(5u64, 'a'), (3, 'b'), (7, 'c')];
+    let result = LearnedMap::bulk_load(&pairs);
+    assert!(matches!(result, Err(Error::NotSorted)));
+}
+
+#[test]
+fn bulk_load_rejects_duplicates() {
+    let pairs = vec![(1u64, "x"), (1, "y")];
+    let result = LearnedMap::bulk_load(&pairs);
+    assert!(matches!(result, Err(Error::NotSorted)));
+}
+
+#[test]
+fn bulk_load_all_keys_retrievable() {
+    let pairs: Vec<(u64, u64)> = (0..500).map(|i| (i * 7, i)).collect();
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+    assert_eq!(map.len(), 500);
+    for &(k, v) in &pairs {
+        assert_eq!(map.get(&k, &g), Some(&v), "missing key {k}");
+    }
+}
+
+#[test]
+fn bulk_load_with_custom_config() {
+    let pairs: Vec<(u64, u64)> = (0..100).map(|i| (i, i)).collect();
+    let config = Config::new().expansion_factor(3.0);
+    let map = LearnedMap::bulk_load_with_config(&pairs, config).unwrap();
+    let g = map.guard();
+    assert_eq!(map.len(), 100);
+    for i in 0..100u64 {
+        assert_eq!(map.get(&i, &g), Some(&i));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LearnedMap: insert / get / remove lifecycle
+// ---------------------------------------------------------------------------
+
+#[test]
+fn insert_get_remove_cycle() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in 0..100u64 {
+        assert!(map.insert(i, i * 10, &g));
+    }
+    assert_eq!(map.len(), 100);
+
+    // All present
+    for i in 0..100u64 {
+        assert_eq!(map.get(&i, &g), Some(&(i * 10)));
+    }
+
+    // Remove odds
+    for i in (1..100u64).step_by(2) {
+        assert!(map.remove(&i, &g));
+    }
+    assert_eq!(map.len(), 50);
+
+    // Evens still present, odds gone
+    for i in 0..100u64 {
+        if i % 2 == 0 {
+            assert_eq!(map.get(&i, &g), Some(&(i * 10)));
+        } else {
+            assert_eq!(map.get(&i, &g), None);
+        }
+    }
+}
+
+#[test]
+fn insert_updates_existing_key() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    assert!(map.insert(1u64, "first", &g));
+    assert!(!map.insert(1, "second", &g));
+    assert_eq!(map.get(&1, &g), Some(&"second"));
+    assert_eq!(map.len(), 1);
+}
+
+#[test]
+fn contains_key_matches_get() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(10u64, (), &g);
+    assert!(map.contains_key(&10, &g));
+    assert!(!map.contains_key(&11, &g));
+    map.remove(&10, &g);
+    assert!(!map.contains_key(&10, &g));
+}
+
+#[test]
+fn remove_returns_false_for_missing() {
+    let map = LearnedMap::<u64, u64>::new();
+    let g = map.guard();
+    map.insert(1, 1, &g);
+    assert!(!map.remove(&999, &g));
+    assert_eq!(map.len(), 1);
+}
+
+#[test]
+fn remove_then_reinsert() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(42u64, "original", &g);
+    map.remove(&42, &g);
+    map.insert(42, "reinserted", &g);
+    assert_eq!(map.get(&42, &g), Some(&"reinserted"));
+    assert_eq!(map.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// LearnedMap: iteration
+// ---------------------------------------------------------------------------
+
+#[test]
+fn iter_sorted_produces_ascending_keys() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    // Insert in reverse order
+    for i in (0..200u64).rev() {
+        map.insert(i, i, &g);
+    }
+    let items: Vec<(u64, u64)> = map.iter_sorted(&g);
+    assert_eq!(items.len(), 200);
+    for w in items.windows(2) {
+        assert!(w[0].0 < w[1].0, "not sorted: {} >= {}", w[0].0, w[1].0);
+    }
+}
+
+#[test]
+fn iter_sorted_after_mixed_ops() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in 0..50u64 {
+        map.insert(i * 2, i, &g);
+    }
+    // Remove some
+    for i in (0..50u64).step_by(3) {
+        map.remove(&(i * 2), &g);
+    }
+    // Insert odds
+    for i in 0..25u64 {
+        map.insert(i * 2 + 1, i + 1000, &g);
+    }
+
+    let items: Vec<(u64, u64)> = map.iter_sorted(&g);
+    assert_eq!(items.len(), map.len());
+    for w in items.windows(2) {
+        assert!(w[0].0 < w[1].0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LearnedMap: FromIterator / Extend
+// ---------------------------------------------------------------------------
+
+#[test]
+fn from_iterator_collects_all() {
+    let map: LearnedMap<u64, u64> = (0..75).map(|i| (i, i)).collect();
+    let g = map.guard();
+    assert_eq!(map.len(), 75);
+    for i in 0..75u64 {
+        assert!(map.contains_key(&i, &g));
+    }
+}
+
+#[test]
+fn extend_adds_to_existing() {
+    let mut map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(1u64, 10, &g);
+    map.extend(vec![(2, 20), (3, 30), (4, 40)]);
+    assert_eq!(map.len(), 4);
+    assert_eq!(map.get(&3, &g), Some(&30));
+}
+
+#[test]
+fn extend_with_overlap_updates() {
+    let mut map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(1u64, 10, &g);
+    map.extend(vec![(1, 99), (2, 20)]);
+    assert_eq!(map.len(), 2);
+    assert_eq!(map.get(&1, &g), Some(&99));
+}
+
+// ---------------------------------------------------------------------------
+// LearnedMap: rebuild
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rebuild_preserves_all_data() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in (0..300u64).rev() {
+        map.insert(i, i * 7, &g);
+    }
+    let len_before = map.len();
+    map.rebuild(&g);
+    assert_eq!(map.len(), len_before);
+    for i in 0..300u64 {
+        assert_eq!(map.get(&i, &g), Some(&(i * 7)), "key {i} lost after rebuild");
+    }
+}
+
+#[test]
+fn rebuild_reduces_depth() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    // Reverse insert creates worst-case chaining
+    for i in (0..200u64).rev() {
+        map.insert(i, i, &g);
+    }
+    let depth_before = map.max_depth(&g);
+    map.rebuild(&g);
+    assert!(
+        map.max_depth(&g) <= depth_before,
+        "rebuild worsened depth: {} -> {}",
+        depth_before,
+        map.max_depth(&g)
+    );
+}
+
+#[test]
+fn rebuild_empty_is_noop() {
+    let map = LearnedMap::<u64, u64>::new();
+    let g = map.guard();
+    map.rebuild(&g);
+    assert!(map.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// LearnedMap: mixed bulk_load + insert
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bulk_load_then_incremental_inserts() {
+    let pairs: Vec<(u64, u64)> = (0..100).map(|i| (i * 2, i)).collect();
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+
+    // Fill in the gaps
+    for i in 0..100u64 {
+        map.insert(i * 2 + 1, i + 1000, &g);
+    }
+    assert_eq!(map.len(), 200);
+
+    for i in 0..200u64 {
+        assert!(map.get(&i, &g).is_some(), "key {i} not found");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LearnedMap: different key types
+// ---------------------------------------------------------------------------
+
+#[test]
+fn works_with_i64_keys() {
+    let pairs: Vec<(i64, &str)> = vec![(-100, "neg"), (-1, "almost"), (0, "zero"), (50, "pos")];
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+    assert_eq!(map.get(&-100, &g), Some(&"neg"));
+    assert_eq!(map.get(&0, &g), Some(&"zero"));
+    assert_eq!(map.get(&50, &g), Some(&"pos"));
+    assert_eq!(map.get(&1, &g), None);
+}
+
+#[test]
+fn works_with_u32_keys() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(u32::MIN, "min", &g);
+    map.insert(u32::MAX, "max", &g);
+    map.insert(1000u32, "mid", &g);
+    assert_eq!(map.len(), 3);
+    assert_eq!(map.get(&u32::MIN, &g), Some(&"min"));
+    assert_eq!(map.get(&u32::MAX, &g), Some(&"max"));
+}
+
+#[test]
+fn works_with_i32_keys() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(i32::MIN, 0, &g);
+    map.insert(0i32, 1, &g);
+    map.insert(i32::MAX, 2, &g);
+    assert_eq!(map.len(), 3);
+    assert_eq!(map.get(&i32::MIN, &g), Some(&0));
+}
+
+// ---------------------------------------------------------------------------
+// LearnedMap: depth invariants
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bulk_load_depth_bounded_1k() {
+    let pairs: Vec<(u64, u64)> = (0..1000).map(|i| (i, i)).collect();
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+    assert!(
+        map.max_depth(&g) <= 5,
+        "depth {} too high for 1000 sequential keys",
+        map.max_depth(&g)
+    );
+}
+
+#[test]
+fn bulk_load_depth_bounded_sparse() {
+    // Highly non-uniform: powers of 2
+    let pairs: Vec<(u64, u64)> = (0..20).map(|i| (1u64 << i, i)).collect();
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+    assert!(
+        map.max_depth(&g) <= 10,
+        "depth {} too high for 20 power-of-2 keys",
+        map.max_depth(&g)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LearnedMap: stress
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stress_1000_random_pattern() {
+    use std::collections::BTreeMap;
+
+    let map = LearnedMap::new();
+    let g = map.guard();
+    let mut oracle = BTreeMap::new();
+
+    // Insert keys with gaps
+    for i in 0..1000u64 {
+        let key = i.wrapping_mul(2_654_435_761) % 100_000;
+        map.insert(key, i, &g);
+        oracle.insert(key, i);
+    }
+
+    assert_eq!(map.len(), oracle.len());
+
+    // Verify all oracle entries
+    for (&k, &v) in &oracle {
+        assert_eq!(map.get(&k, &g), Some(&v), "mismatch at key {k}");
+    }
+
+    // Remove half
+    let keys_to_remove: Vec<u64> = oracle.keys().step_by(2).copied().collect();
+    for k in &keys_to_remove {
+        map.remove(k, &g);
+        oracle.remove(k);
+    }
+
+    assert_eq!(map.len(), oracle.len());
+    for (&k, &v) in &oracle {
+        assert_eq!(map.get(&k, &g), Some(&v), "mismatch after removal at key {k}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LearnedSet
+// ---------------------------------------------------------------------------
+
+#[test]
+fn set_empty() {
+    let set = LearnedSet::<u64>::new();
+    let g = set.guard();
+    assert!(set.is_empty());
+    assert_eq!(set.len(), 0);
+    assert!(!set.contains(&0, &g));
+}
+
+#[test]
+fn set_insert_contains_remove() {
+    let set = LearnedSet::new();
+    let g = set.guard();
+    assert!(set.insert(10u64, &g));
+    assert!(set.insert(20, &g));
+    assert!(!set.insert(10, &g)); // duplicate
+    assert_eq!(set.len(), 2);
+
+    assert!(set.contains(&10, &g));
+    assert!(set.contains(&20, &g));
+    assert!(!set.contains(&30, &g));
+
+    assert!(set.remove(&10, &g));
+    assert!(!set.remove(&10, &g)); // already removed
+    assert_eq!(set.len(), 1);
+    assert!(!set.contains(&10, &g));
+}
+
+#[test]
+fn set_bulk_load() {
+    let keys: Vec<u64> = (0..200).collect();
+    let set = LearnedSet::bulk_load(&keys).unwrap();
+    let g = set.guard();
+    assert_eq!(set.len(), 200);
+    for k in &keys {
+        assert!(set.contains(k, &g), "missing key {k}");
+    }
+    assert!(!set.contains(&200, &g));
+}
+
+#[test]
+fn set_bulk_load_rejects_unsorted() {
+    let keys = vec![5u64, 3, 7];
+    assert!(LearnedSet::bulk_load(&keys).is_err());
+}
+
+#[test]
+fn set_from_iterator() {
+    let set: LearnedSet<u64> = (0..50).collect();
+    let g = set.guard();
+    assert_eq!(set.len(), 50);
+    for i in 0..50u64 {
+        assert!(set.contains(&i, &g));
+    }
+}
+
+#[test]
+fn set_extend() {
+    let mut set = LearnedSet::new();
+    let g = set.guard();
+    set.insert(1u64, &g);
+    set.extend(vec![2, 3, 4, 5]);
+    assert_eq!(set.len(), 5);
+}
+
+#[test]
+fn set_extend_with_duplicates() {
+    let mut set: LearnedSet<u64> = (0..10).collect();
+    set.extend(0..10); // all duplicates
+    assert_eq!(set.len(), 10);
+}
+
+#[test]
+fn set_default() {
+    let set = LearnedSet::<u64>::default();
+    assert!(set.is_empty());
+}
+
+#[test]
+fn set_with_config() {
+    let config = Config::new().expansion_factor(3.0);
+    let set = LearnedSet::with_config(config);
+    let g = set.guard();
+    set.insert(1u64, &g);
+    set.insert(2, &g);
+    assert_eq!(set.len(), 2);
+}
+
+#[test]
+fn set_large_insert_remove() {
+    let set = LearnedSet::new();
+    let g = set.guard();
+    for i in 0..500u64 {
+        set.insert(i, &g);
+    }
+    assert_eq!(set.len(), 500);
+
+    for i in (0..500u64).step_by(2) {
+        set.remove(&i, &g);
+    }
+    assert_eq!(set.len(), 250);
+
+    for i in 0..500u64 {
+        if i % 2 == 0 {
+            assert!(!set.contains(&i, &g));
+        } else {
+            assert!(set.contains(&i, &g));
+        }
+    }
+}

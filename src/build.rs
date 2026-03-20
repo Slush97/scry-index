@@ -1,10 +1,11 @@
 //! Bulk-load construction for building a learned index from sorted data.
+#![allow(unsafe_code)]
 
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::key::Key;
 use crate::model::fit_fmcd;
-use crate::node::{Node, Slot};
+use crate::node::{Node, SlotInner};
 
 /// Build a learned index tree from sorted key-value pairs.
 ///
@@ -34,36 +35,46 @@ fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Config) -> Node<
     let keys: Vec<K> = pairs.iter().map(|(k, _)| *k).collect();
     let result = fit_fmcd(&keys, config.expansion_factor);
 
-    let mut node = Node::with_capacity(result.model, result.array_size);
+    let node = Node::with_capacity(result.model, result.array_size);
 
     if result.conflicts == 0 {
         // No conflicts — place each key-value directly in its predicted slot
         for (key, value) in pairs {
             let slot = node.predict_slot(*key);
-            node.slots[slot] = Slot::Data(*key, value.clone());
-            node.num_keys += 1;
+            node.store_slot(slot, SlotInner::Data { key: *key, value: value.clone() });
+            node.inc_keys();
         }
     } else {
-        // Conflicts exist — group keys by predicted slot, recurse on groups
-        let mut groups: Vec<Vec<(K, V)>> = vec![Vec::new(); result.array_size];
-        for (key, value) in pairs {
-            let slot = node.predict_slot(*key);
-            groups[slot].push((*key, value.clone()));
-        }
+        // Conflicts exist — sort by predicted slot, then process runs.
+        // This avoids allocating one Vec per slot (which can be huge for large
+        // array_size with few actual conflicts).
+        let mut assignments: Vec<(usize, usize)> = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (k, _))| (node.predict_slot(*k), i))
+            .collect();
+        assignments.sort_unstable_by_key(|&(slot, _)| slot);
 
-        for (slot_idx, group) in groups.into_iter().enumerate() {
-            match group.len() {
-                0 => {} // Slot::Empty (already initialized)
-                1 => {
-                    let (k, v) = group.into_iter().next().expect("checked len == 1");
-                    node.slots[slot_idx] = Slot::Data(k, v);
-                    node.num_keys += 1;
-                }
-                _ => {
-                    // Multiple keys map to this slot — create a child node
-                    let child = build_recursive(&group, config);
-                    node.slots[slot_idx] = Slot::Child(Box::new(child));
-                }
+        let mut i = 0;
+        while i < assignments.len() {
+            let slot_idx = assignments[i].0;
+            let start = i;
+            while i < assignments.len() && assignments[i].0 == slot_idx {
+                i += 1;
+            }
+            let run = &assignments[start..i];
+            if run.len() == 1 {
+                let (k, v) = &pairs[run[0].1];
+                node.store_slot(slot_idx, SlotInner::Data { key: *k, value: v.clone() });
+                node.inc_keys();
+            } else {
+                let child_pairs: Vec<(K, V)> =
+                    run.iter().map(|&(_, idx)| {
+                        let (k, v) = &pairs[idx];
+                        (*k, v.clone())
+                    }).collect();
+                let child = build_recursive(&child_pairs, config);
+                node.store_slot(slot_idx, SlotInner::Child(child));
             }
         }
     }
@@ -75,8 +86,14 @@ fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Config) -> Node<
 mod tests {
     use super::*;
 
+    use crossbeam_epoch as epoch;
+
     fn default_config() -> Config {
         Config::default()
+    }
+
+    fn guard() -> epoch::Guard {
+        epoch::pin()
     }
 
     #[test]
@@ -101,36 +118,41 @@ mod tests {
 
     #[test]
     fn bulk_load_single() {
+        let g = guard();
         let pairs = vec![(42u64, "hello")];
         let node = bulk_load(&pairs, &default_config()).unwrap();
-        assert_eq!(node.total_keys(), 1);
+        assert_eq!(node.total_keys(&g), 1);
     }
 
     #[test]
     fn bulk_load_sequential() {
+        let g = guard();
         let pairs: Vec<(u64, usize)> = (0..100).map(|i| (i, i as usize)).collect();
         let node = bulk_load(&pairs, &default_config()).unwrap();
-        assert_eq!(node.total_keys(), 100);
+        assert_eq!(node.total_keys(&g), 100);
     }
 
     #[test]
     fn bulk_load_preserves_all_keys() {
+        let g = guard();
         let pairs: Vec<(u64, u64)> = (0..50).map(|i| (i * 7 + 3, i)).collect();
         let node = bulk_load(&pairs, &default_config()).unwrap();
-        assert_eq!(node.total_keys(), 50);
+        assert_eq!(node.total_keys(&g), 50);
     }
 
     #[test]
     fn bulk_load_sparse_keys() {
+        let g = guard();
         let pairs = vec![(1u64, 'a'), (1000, 'b'), (1_000_000, 'c')];
         let node = bulk_load(&pairs, &default_config()).unwrap();
-        assert_eq!(node.total_keys(), 3);
+        assert_eq!(node.total_keys(&g), 3);
     }
 
     #[test]
     fn bulk_load_signed_keys() {
+        let g = guard();
         let pairs: Vec<(i64, &str)> = vec![(-100, "neg"), (0, "zero"), (100, "pos")];
         let node = bulk_load(&pairs, &default_config()).unwrap();
-        assert_eq!(node.total_keys(), 3);
+        assert_eq!(node.total_keys(&g), 3);
     }
 }

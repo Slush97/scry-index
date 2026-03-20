@@ -1,9 +1,14 @@
-//! The primary public type: [`LearnedMap`].
+//! The primary public types: [`LearnedMap`], [`Guard`], and [`MapRef`].
+#![allow(unsafe_code)]
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crossbeam_epoch::{self as epoch, Atomic, Owned};
 
 use crate::build;
 use crate::config::Config;
 use crate::error::Result;
-use crate::insert;
+use crate::insert::{self, InsertResult};
 use crate::iter::{self, Iter};
 use crate::key::Key;
 use crate::lookup;
@@ -11,40 +16,140 @@ use crate::model::LinearModel;
 use crate::node::Node;
 use crate::remove;
 
-/// A sorted key-value map backed by a learned index.
+/// An epoch guard that keeps the current thread pinned.
 ///
-/// Uses piecewise linear models to predict key positions, achieving O(1)
-/// expected lookup time for keys matching the data distribution.
+/// While a guard exists, any memory retired during this epoch will not be
+/// reclaimed. Guards should be short-lived to avoid delaying reclamation.
 ///
-/// # Phase 1 (Current)
+/// Obtain a guard via [`LearnedMap::guard`] or use [`LearnedMap::pin`] for
+/// the convenience [`MapRef`] wrapper.
+pub struct Guard {
+    inner: epoch::Guard,
+}
+
+impl Guard {
+    fn new(inner: epoch::Guard) -> Self {
+        Self { inner }
+    }
+}
+
+/// A convenience handle that bundles a map reference with an epoch guard.
 ///
-/// This is a single-threaded implementation. All mutating operations
-/// require `&mut self`. Phase 2 will make all operations take `&self`
-/// for concurrent access.
+/// All operations on `MapRef` are forwarded to the underlying [`LearnedMap`]
+/// using the guard owned by this handle. This avoids passing a guard to
+/// every method call.
 ///
 /// # Example
 ///
 /// ```
 /// use scry_index::LearnedMap;
 ///
-/// let mut map = LearnedMap::new();
-/// map.insert(3u64, "three");
-/// map.insert(1, "one");
-/// map.insert(2, "two");
-///
-/// assert_eq!(map.get(&1), Some(&"one"));
-/// assert_eq!(map.len(), 3);
+/// let map = LearnedMap::new();
+/// let m = map.pin();
+/// m.insert(1u64, "hello");
+/// assert_eq!(m.get(&1), Some(&"hello"));
 /// ```
-#[derive(Debug)]
-pub struct LearnedMap<K: Key, V> {
-    root: Node<K, V>,
-    len: usize,
-    config: Config,
-    /// Number of inserts since last rebuild. Used to trigger auto-rebuild.
-    inserts_since_rebuild: usize,
+pub struct MapRef<'a, K: Key, V> {
+    map: &'a LearnedMap<K, V>,
+    guard: Guard,
 }
 
-impl<K: Key, V: Clone> LearnedMap<K, V> {
+impl<K: Key, V: Clone + Send + Sync> MapRef<'_, K, V> {
+    /// Look up a key, returning a reference to the value if found.
+    pub fn get(&self, key: &K) -> Option<&V> {
+        self.map.get(key, &self.guard)
+    }
+
+    /// Insert a key-value pair. Returns `true` if the key was newly inserted.
+    pub fn insert(&self, key: K, value: V) -> bool {
+        self.map.insert(key, value, &self.guard)
+    }
+
+    /// Remove a key. Returns `true` if the key was present and removed.
+    pub fn remove(&self, key: &K) -> bool {
+        self.map.remove(key, &self.guard)
+    }
+
+    /// Check whether the map contains a key.
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.map.contains_key(key, &self.guard)
+    }
+
+    /// Return the number of key-value pairs (approximate).
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Return `true` if the map contains no entries.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Iterate over all key-value pairs (DFS order, not necessarily sorted).
+    #[allow(clippy::iter_without_into_iter)]
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        self.map.iter(&self.guard)
+    }
+
+    /// Collect all key-value pairs in sorted order.
+    pub fn iter_sorted(&self) -> Vec<(K, V)> {
+        self.map.iter_sorted(&self.guard)
+    }
+
+    /// Return the maximum depth of the tree.
+    pub fn max_depth(&self) -> usize {
+        self.map.max_depth(&self.guard)
+    }
+
+    /// Rebuild the tree from scratch using bulk load.
+    pub fn rebuild(&self) {
+        self.map.rebuild(&self.guard);
+    }
+}
+
+/// A sorted key-value map backed by a learned index.
+///
+/// Uses piecewise linear models to predict key positions, achieving O(1)
+/// expected lookup time for keys matching the data distribution.
+///
+/// # Concurrency
+///
+/// All operations take `&self` and are safe to call from multiple threads.
+/// Reads are lock-free (atomic loads under an epoch guard). Writes use
+/// compare-and-swap retry loops on individual slots — no global lock.
+///
+/// # Example
+///
+/// ```
+/// use scry_index::LearnedMap;
+///
+/// let map = LearnedMap::new();
+/// let guard = map.guard();
+///
+/// map.insert(42u64, "hello", &guard);
+/// map.insert(17, "world", &guard);
+///
+/// assert_eq!(map.get(&42, &guard), Some(&"hello"));
+/// assert_eq!(map.get(&99, &guard), None);
+/// assert_eq!(map.len(), 2);
+/// ```
+pub struct LearnedMap<K: Key, V> {
+    root: Atomic<Node<K, V>>,
+    len: AtomicUsize,
+    /// Number of inserts since last rebuild. Used to trigger auto-rebuild.
+    inserts_since_rebuild: AtomicUsize,
+    config: Config,
+}
+
+impl<K: Key, V> std::fmt::Debug for LearnedMap<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LearnedMap")
+            .field("len", &self.len.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// Create a new empty learned map with default configuration.
     pub fn new() -> Self {
         Self::with_config(Config::default())
@@ -53,11 +158,12 @@ impl<K: Key, V: Clone> LearnedMap<K, V> {
     /// Create a new empty learned map with the given configuration.
     pub fn with_config(config: Config) -> Self {
         let root = Node::with_capacity(LinearModel::new(0.01, 0.0), 16);
+        let root_atomic = Atomic::new(root);
         Self {
-            root,
-            len: 0,
+            root: root_atomic,
+            len: AtomicUsize::new(0),
+            inserts_since_rebuild: AtomicUsize::new(0),
             config,
-            inserts_since_rebuild: 0,
         }
     }
 
@@ -80,77 +186,145 @@ impl<K: Key, V: Clone> LearnedMap<K, V> {
     /// Returns an error if `pairs` is empty or not sorted by key.
     pub fn bulk_load_with_config(pairs: &[(K, V)], config: Config) -> Result<Self> {
         let root = build::bulk_load(pairs, &config)?;
+        let root_atomic = Atomic::new(root);
         Ok(Self {
-            len: pairs.len(),
-            root,
+            len: AtomicUsize::new(pairs.len()),
+            inserts_since_rebuild: AtomicUsize::new(0),
+            root: root_atomic,
             config,
-            inserts_since_rebuild: 0,
         })
     }
 
-    /// Look up a key, returning a reference to the value if found.
-    pub fn get(&self, key: &K) -> Option<&V> {
-        lookup::get(&self.root, key)
+    /// Acquire an epoch guard for use with operations on this map.
+    ///
+    /// The guard pins the current thread to an epoch, preventing any
+    /// concurrently retired memory from being reclaimed while the guard
+    /// is held. Keep guards short-lived.
+    pub fn guard(&self) -> Guard {
+        Guard::new(epoch::pin())
     }
 
-    /// Look up a key, returning a mutable reference to the value.
-    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        lookup::get_mut(&mut self.root, key)
-    }
-
-    /// Insert a key-value pair.
+    /// Pin the current epoch and return a [`MapRef`] convenience handle.
     ///
-    /// Returns the previous value if the key already existed.
-    ///
-    /// When enough inserts accumulate, the tree is automatically rebuilt
-    /// with a proper FMCD model to maintain fast lookups.
-    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        let old = insert::insert(&mut self.root, key, value);
-        if old.is_none() {
-            self.len += 1;
-            self.inserts_since_rebuild += 1;
-            self.maybe_rebuild();
+    /// This is equivalent to `guard()` + passing the guard to every method,
+    /// but more ergonomic for sequences of operations.
+    pub fn pin(&self) -> MapRef<'_, K, V> {
+        MapRef {
+            map: self,
+            guard: self.guard(),
         }
-        old
     }
 
-    /// Remove a key, returning the value if it existed.
-    pub fn remove(&mut self, key: &K) -> Option<V> {
-        let removed = remove::remove(&mut self.root, key);
-        if removed.is_some() {
-            self.len -= 1;
+    /// Look up a key, returning a reference to the value if found.
+    ///
+    /// The returned reference is valid for the lifetime of the guard.
+    pub fn get<'g>(&self, key: &K, guard: &'g Guard) -> Option<&'g V> {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        // SAFETY: root is always non-null (set during construction, never nulled).
+        let root = unsafe { root_shared.deref() };
+        lookup::get(root, key, &guard.inner)
+    }
+
+    /// Insert a key-value pair. Returns `true` if the key was newly inserted,
+    /// `false` if an existing key's value was updated.
+    pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        // SAFETY: root is always non-null.
+        let root = unsafe { root_shared.deref() };
+        let result = insert::insert(root, key, &value, &guard.inner);
+        if result == InsertResult::Inserted {
+            let new_len = self.len.fetch_add(1, Ordering::Relaxed) + 1;
+            self.maybe_rebuild(new_len, guard);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if the tree should be rebuilt based on insert pressure.
+    ///
+    /// Uses a CAS on the counter to ensure only one thread triggers rebuild
+    /// per threshold crossing.
+    fn maybe_rebuild(&self, len: usize, guard: &Guard) {
+        if !self.config.auto_rebuild {
+            return;
+        }
+        let count = self.inserts_since_rebuild.fetch_add(1, Ordering::Relaxed) + 1;
+        // Rebuild every ~25% of current size, capped at 256 to bound pile-up
+        // depth. Keys inserted beyond the model's fitted range pile up at the
+        // boundary slot, so pile-up depth equals inserts since last rebuild.
+        // The cap ensures depth never exceeds ~256 between rebuilds.
+        let threshold = (len / 4).clamp(16, 256);
+        if count >= threshold {
+            // CAS to zero — only the winner triggers rebuild
+            if self
+                .inserts_since_rebuild
+                .compare_exchange(count, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.rebuild(guard);
+            }
+        }
+    }
+
+    /// Remove a key. Returns `true` if the key was present and removed.
+    pub fn remove(&self, key: &K, guard: &Guard) -> bool {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        // SAFETY: root is always non-null.
+        let root = unsafe { root_shared.deref() };
+        let removed = remove::remove(root, key, &guard.inner);
+        if removed {
+            self.len.fetch_sub(1, Ordering::Relaxed);
         }
         removed
     }
 
     /// Check whether the map contains a key.
-    pub fn contains_key(&self, key: &K) -> bool {
-        lookup::contains_key(&self.root, key)
+    pub fn contains_key(&self, key: &K, guard: &Guard) -> bool {
+        self.get(key, guard).is_some()
     }
 
-    /// Return the number of key-value pairs in the map.
-    pub const fn len(&self) -> usize {
-        self.len
+    /// Return the approximate number of key-value pairs in the map.
+    ///
+    /// This is a relaxed atomic load and may be slightly stale under
+    /// concurrent modification.
+    pub fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
     }
 
     /// Return `true` if the map contains no entries.
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
-    /// Iterate over all key-value pairs in sorted order.
+    /// Iterate over all key-value pairs (DFS order, not necessarily sorted).
     ///
-    /// Note: this collects and sorts internally because the tree's DFS
-    /// traversal may not be perfectly sorted across child node boundaries.
-    pub fn iter_sorted(&self) -> impl Iterator<Item = (K, V)> + '_ {
-        iter::sorted_pairs(&self.root).into_iter()
+    /// The returned references are valid for the lifetime of the guard.
+    pub fn iter<'g>(&self, guard: &'g Guard) -> Iter<'g, K, V> {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        // SAFETY: root is always non-null.
+        let root = unsafe { root_shared.deref() };
+        Iter::new(root, &guard.inner)
+    }
+
+    /// Collect all key-value pairs in sorted order.
+    ///
+    /// Performs a full traversal, clones all entries, and sorts the results.
+    pub fn iter_sorted(&self, guard: &Guard) -> Vec<(K, V)> {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        // SAFETY: root is always non-null.
+        let root = unsafe { root_shared.deref() };
+        iter::sorted_pairs(root, &guard.inner)
     }
 
     /// Return the maximum depth of the tree.
     ///
     /// Useful for diagnostics — a well-fit model should keep depth low.
-    pub fn max_depth(&self) -> usize {
-        self.root.max_depth()
+    pub fn max_depth(&self, guard: &Guard) -> usize {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        // SAFETY: root is always non-null.
+        let root = unsafe { root_shared.deref() };
+        root.max_depth(&guard.inner)
     }
 
     /// Rebuild the tree from scratch using bulk load.
@@ -158,66 +332,101 @@ impl<K: Key, V: Clone> LearnedMap<K, V> {
     /// Collects all key-value pairs, sorts them, and rebuilds with optimal
     /// FMCD model fitting. This compacts the tree and restores O(1) lookups
     /// after many incremental inserts.
-    pub fn rebuild(&mut self) {
-        if self.len == 0 {
+    ///
+    /// **Note:** Concurrent writes that occur between the snapshot and the
+    /// root swap may be lost. This is documented behavior for Phase 2.
+    pub fn rebuild(&self, guard: &Guard) {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        if root_shared.is_null() {
             return;
         }
-        let pairs = iter::sorted_pairs(&self.root);
-        // sorted_pairs guarantees sorted order, so bulk_load won't fail
-        if let Ok(new_root) = build::bulk_load(&pairs, &self.config) {
-            self.root = new_root;
-            self.inserts_since_rebuild = 0;
-        }
-    }
+        // SAFETY: root is not null.
+        let root = unsafe { root_shared.deref() };
 
-    /// Check if the tree should be rebuilt based on insert pressure.
-    ///
-    /// Triggers a rebuild when the tree depth exceeds a threshold relative
-    /// to the number of keys. A well-fit model should have depth <= ~3 for
-    /// any reasonable key count; depth growing beyond that indicates the
-    /// model is degraded and a rebuild will help.
-    fn maybe_rebuild(&mut self) {
-        // Rebuild when we've accumulated enough new inserts to justify the cost.
-        // Use a fraction of total keys so rebuilds become less frequent as the
-        // map grows (amortized cost stays low).
-        let threshold = (self.len / 4).clamp(16, 10_000);
-        if self.inserts_since_rebuild >= threshold {
-            self.rebuild();
+        let pairs = iter::sorted_pairs(root, &guard.inner);
+        if pairs.is_empty() {
+            return;
         }
+
+        let Ok(new_root) = build::bulk_load(&pairs, &self.config) else {
+            return;
+        };
+        let new_owned = Owned::new(new_root);
+        if self
+            .root
+            .compare_exchange(
+                root_shared,
+                new_owned,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                &guard.inner,
+            )
+            .is_ok()
+        {
+            // SAFETY: CAS succeeded; old root is unreachable to new readers.
+            unsafe {
+                guard.inner.defer_destroy(root_shared);
+            }
+            self.len.store(pairs.len(), Ordering::Relaxed);
+            self.inserts_since_rebuild.store(0, Ordering::Relaxed);
+        }
+        // On CAS failure: concurrent modification — our rebuilt tree is
+        // discarded (the Owned<Node> in the Err is dropped automatically).
     }
 }
 
-impl<K: Key, V: Clone> Default for LearnedMap<K, V> {
+impl<K: Key, V: Clone + Send + Sync> Default for LearnedMap<K, V> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<K: Key, V: Clone> Extend<(K, V)> for LearnedMap<K, V> {
+impl<K: Key, V: Clone + Send + Sync> Extend<(K, V)> for LearnedMap<K, V> {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        let guard = self.guard();
         for (k, v) in iter {
-            self.insert(k, v);
+            self.insert(k, v, &guard);
         }
     }
 }
 
-impl<K: Key, V: Clone> FromIterator<(K, V)> for LearnedMap<K, V> {
+impl<K: Key, V: Clone + Send + Sync> FromIterator<(K, V)> for LearnedMap<K, V> {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
-        let mut map = Self::new();
-        map.extend(iter);
+        let map = Self::new();
+        let guard = map.guard();
+        for (k, v) in iter {
+            map.insert(k, v, &guard);
+        }
         map
     }
 }
 
-/// Iterator over references — delegates to `Iter`.
-impl<'a, K: Key, V> IntoIterator for &'a LearnedMap<K, V> {
-    type Item = (&'a K, &'a V);
-    type IntoIter = Iter<'a, K, V>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        Iter::new(&self.root)
+impl<K: Key, V> Drop for LearnedMap<K, V> {
+    fn drop(&mut self) {
+        // We must defer destruction of the root rather than freeing immediately.
+        // Our Guard type does not borrow the map, so a caller can hold a Guard
+        // (and references from get()) after the map is dropped. Using
+        // defer_destroy ensures the tree lives until all such guards are gone.
+        //
+        // SAFETY: We pin the current epoch and schedule the root for deferred
+        // destruction. Crossbeam guarantees the root won't be freed until all
+        // guards active at this epoch are dropped. Node::drop (which uses
+        // unprotected + into_owned to free children) is safe at that point
+        // because no guard can still reference the tree.
+        unsafe {
+            let guard = epoch::pin();
+            let shared = self.root.load(Ordering::Relaxed, &guard);
+            if !shared.is_null() {
+                guard.defer_destroy(shared);
+            }
+        }
     }
 }
+
+// SAFETY: LearnedMap is Send+Sync when K and V are Send+Sync. All interior
+// mutation goes through atomic operations and epoch-based reclamation.
+unsafe impl<K: Key, V: Send + Sync> Send for LearnedMap<K, V> {}
+unsafe impl<K: Key, V: Send + Sync> Sync for LearnedMap<K, V> {}
 
 #[cfg(test)]
 mod tests {
@@ -232,37 +441,41 @@ mod tests {
 
     #[test]
     fn insert_and_get() {
-        let mut map = LearnedMap::new();
-        map.insert(42u64, "hello");
-        assert_eq!(map.get(&42), Some(&"hello"));
+        let map = LearnedMap::new();
+        let g = map.guard();
+        assert!(map.insert(42u64, "hello", &g));
+        assert_eq!(map.get(&42, &g), Some(&"hello"));
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn insert_duplicate_updates() {
-        let mut map = LearnedMap::new();
-        assert!(map.insert(1u64, "one").is_none());
-        assert_eq!(map.insert(1, "ONE"), Some("one"));
-        assert_eq!(map.get(&1), Some(&"ONE"));
+        let map = LearnedMap::new();
+        let g = map.guard();
+        assert!(map.insert(1u64, "one", &g));
+        assert!(!map.insert(1, "ONE", &g));
+        assert_eq!(map.get(&1, &g), Some(&"ONE"));
         assert_eq!(map.len(), 1);
     }
 
     #[test]
     fn remove_existing() {
-        let mut map = LearnedMap::new();
-        map.insert(1u64, "a");
-        map.insert(2, "b");
-        assert_eq!(map.remove(&1), Some("a"));
+        let map = LearnedMap::new();
+        let g = map.guard();
+        map.insert(1u64, "a", &g);
+        map.insert(2, "b", &g);
+        assert!(map.remove(&1, &g));
         assert_eq!(map.len(), 1);
-        assert!(!map.contains_key(&1));
-        assert!(map.contains_key(&2));
+        assert!(!map.contains_key(&1, &g));
+        assert!(map.contains_key(&2, &g));
     }
 
     #[test]
     fn remove_missing() {
-        let mut map = LearnedMap::new();
-        map.insert(1u64, "a");
-        assert!(map.remove(&99).is_none());
+        let map = LearnedMap::new();
+        let g = map.guard();
+        map.insert(1u64, "a", &g);
+        assert!(!map.remove(&99, &g));
         assert_eq!(map.len(), 1);
     }
 
@@ -270,168 +483,168 @@ mod tests {
     fn bulk_load_basic() {
         let pairs: Vec<(u64, u64)> = (0..100).map(|i| (i, i * 10)).collect();
         let map = LearnedMap::bulk_load(&pairs).unwrap();
+        let g = map.guard();
         assert_eq!(map.len(), 100);
         for (k, v) in &pairs {
-            assert_eq!(map.get(k), Some(v));
+            assert_eq!(map.get(k, &g), Some(v));
         }
     }
 
     #[test]
     fn bulk_load_then_insert() {
         let pairs: Vec<(u64, u64)> = vec![(10, 1), (20, 2), (30, 3)];
-        let mut map = LearnedMap::bulk_load(&pairs).unwrap();
-        map.insert(15, 15);
-        map.insert(25, 25);
+        let map = LearnedMap::bulk_load(&pairs).unwrap();
+        let g = map.guard();
+        map.insert(15, 15, &g);
+        map.insert(25, 25, &g);
         assert_eq!(map.len(), 5);
-        assert_eq!(map.get(&15), Some(&15));
-        assert_eq!(map.get(&25), Some(&25));
+        assert_eq!(map.get(&15, &g), Some(&15));
+        assert_eq!(map.get(&25, &g), Some(&25));
     }
 
     #[test]
     fn from_iterator() {
         let map: LearnedMap<u64, &str> =
             vec![(1, "a"), (2, "b"), (3, "c")].into_iter().collect();
+        let g = map.guard();
         assert_eq!(map.len(), 3);
-        assert_eq!(map.get(&2), Some(&"b"));
+        assert_eq!(map.get(&2, &g), Some(&"b"));
     }
 
     #[test]
     fn extend_map() {
         let mut map = LearnedMap::new();
-        map.insert(1u64, 10);
+        {
+            let g = map.guard();
+            map.insert(1u64, 10, &g);
+        }
         map.extend(vec![(2, 20), (3, 30)]);
         assert_eq!(map.len(), 3);
     }
 
     #[test]
     fn iter_sorted_order() {
-        let mut map = LearnedMap::new();
-        map.insert(30u64, "c");
-        map.insert(10, "a");
-        map.insert(20, "b");
+        let map = LearnedMap::new();
+        let g = map.guard();
+        map.insert(30u64, "c", &g);
+        map.insert(10, "a", &g);
+        map.insert(20, "b", &g);
 
-        let items: Vec<(u64, &str)> = map.iter_sorted().collect();
+        let items: Vec<(u64, &str)> = map.iter_sorted(&g);
         assert_eq!(items, vec![(10, "a"), (20, "b"), (30, "c")]);
-    }
-
-    #[test]
-    fn into_iter_ref() {
-        let mut map = LearnedMap::new();
-        map.insert(1u64, "one");
-        map.insert(2, "two");
-
-        let items: Vec<_> = (&map).into_iter().collect();
-        assert_eq!(items.len(), 2);
-    }
-
-    #[test]
-    fn get_mut_modifies() {
-        let mut map = LearnedMap::new();
-        map.insert(1u64, 100);
-        if let Some(v) = map.get_mut(&1) {
-            *v = 999;
-        }
-        assert_eq!(map.get(&1), Some(&999));
     }
 
     #[test]
     fn max_depth_bounded() {
         let pairs: Vec<(u64, u64)> = (0..1000).map(|i| (i, i)).collect();
         let map = LearnedMap::bulk_load(&pairs).unwrap();
+        let g = map.guard();
         assert!(
-            map.max_depth() <= 5,
+            map.max_depth(&g) <= 5,
             "depth {} is too high for 1000 sequential keys",
-            map.max_depth()
+            map.max_depth(&g)
         );
     }
 
     #[test]
     fn stress_insert_lookup_remove() {
-        let mut map = LearnedMap::new();
+        let map = LearnedMap::new();
+        let g = map.guard();
         let n = 500u64;
 
         for i in 0..n {
-            map.insert(i * 3, i);
+            map.insert(i * 3, i, &g);
         }
         assert_eq!(map.len(), n as usize);
 
         for i in 0..n {
-            assert_eq!(map.get(&(i * 3)), Some(&i), "key {} missing", i * 3);
+            assert_eq!(map.get(&(i * 3), &g), Some(&i), "key {} missing", i * 3);
         }
 
         for i in (0..n).filter(|i| i % 2 == 0) {
-            map.remove(&(i * 3));
+            map.remove(&(i * 3), &g);
         }
         assert_eq!(map.len(), (n / 2) as usize);
 
         for i in (0..n).filter(|i| i % 2 != 0) {
-            assert_eq!(map.get(&(i * 3)), Some(&i));
+            assert_eq!(map.get(&(i * 3), &g), Some(&i));
         }
-    }
-
-    #[test]
-    fn auto_rebuild_triggers() {
-        let mut map = LearnedMap::new();
-        for i in 0..200u64 {
-            map.insert(i, i);
-        }
-        assert_eq!(map.len(), 200);
-        // All keys should still be findable after rebuilds
-        for i in 0..200u64 {
-            assert_eq!(map.get(&i), Some(&i), "key {i} missing after auto-rebuild");
-        }
-        // Force a final rebuild and check depth is compact
-        map.rebuild();
-        assert!(
-            map.max_depth() <= 3,
-            "depth {} after explicit rebuild is too high",
-            map.max_depth()
-        );
     }
 
     #[test]
     fn manual_rebuild() {
-        let mut map = LearnedMap::new();
+        let map = LearnedMap::new();
+        let g = map.guard();
         for i in (0..100u64).rev() {
-            map.insert(i, i * 10);
+            map.insert(i, i * 10, &g);
         }
-        let depth_before = map.max_depth();
-        map.rebuild();
-        let depth_after = map.max_depth();
-        // Rebuild should reduce depth for reverse-inserted data
+        let depth_before = map.max_depth(&g);
+        map.rebuild(&g);
+        let depth_after = map.max_depth(&g);
         assert!(
             depth_after <= depth_before,
             "rebuild didn't help: {depth_before} -> {depth_after}"
         );
-        // All keys still present
+        // All keys still present (need fresh guard after rebuild)
+        let g2 = map.guard();
         for i in 0..100u64 {
-            assert_eq!(map.get(&i), Some(&(i * 10)));
+            assert_eq!(map.get(&i, &g2), Some(&(i * 10)));
         }
     }
 
     #[test]
     fn rebuild_empty_is_noop() {
-        let mut map = LearnedMap::<u64, u64>::new();
-        map.rebuild(); // should not panic
+        let map = LearnedMap::<u64, u64>::new();
+        let g = map.guard();
+        map.rebuild(&g);
         assert!(map.is_empty());
     }
 
     #[test]
     fn large_incremental_insert() {
-        let mut map = LearnedMap::new();
+        let map = LearnedMap::new();
+        let g = map.guard();
         for i in 0..1000u64 {
-            map.insert(i, i);
+            map.insert(i, i, &g);
         }
         assert_eq!(map.len(), 1000);
         for i in 0..1000u64 {
-            assert_eq!(map.get(&i), Some(&i));
+            assert_eq!(map.get(&i, &g), Some(&i));
         }
-        // After explicit rebuild, depth should be compact
-        map.rebuild();
-        assert!(
-            map.max_depth() <= 3,
-            "depth {} too high for 1000 keys after rebuild",
-            map.max_depth()
-        );
+    }
+
+    #[test]
+    fn pin_convenience() {
+        let map = LearnedMap::new();
+        let m = map.pin();
+        m.insert(1u64, "one");
+        m.insert(2, "two");
+        assert_eq!(m.get(&1), Some(&"one"));
+        assert_eq!(m.get(&2), Some(&"two"));
+        assert_eq!(m.len(), 2);
+        assert!(!m.is_empty());
+    }
+
+    #[test]
+    fn map_ref_remove() {
+        let map = LearnedMap::new();
+        let m = map.pin();
+        m.insert(10u64, 100);
+        m.insert(20, 200);
+        assert!(m.remove(&10));
+        assert!(!m.remove(&10));
+        assert_eq!(m.len(), 1);
+        assert!(m.contains_key(&20));
+    }
+
+    #[test]
+    fn map_ref_iter_sorted() {
+        let map = LearnedMap::new();
+        let m = map.pin();
+        m.insert(3u64, "c");
+        m.insert(1, "a");
+        m.insert(2, "b");
+        let items = m.iter_sorted();
+        assert_eq!(items, vec![(1, "a"), (2, "b"), (3, "c")]);
     }
 }

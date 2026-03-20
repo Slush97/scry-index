@@ -13,6 +13,15 @@ pub struct Config {
     ///
     /// Default: `2.0`. Must be `>= 1.0`.
     pub expansion_factor: f64,
+
+    /// Whether to automatically rebuild the tree after a threshold of inserts.
+    ///
+    /// When enabled, the map periodically rebuilds with optimal FMCD model
+    /// fitting to keep the tree shallow and lookups fast. The rebuild threshold
+    /// is `(len / 4).clamp(16, 10_000)`.
+    ///
+    /// Default: `true`.
+    pub auto_rebuild: bool,
 }
 
 impl Config {
@@ -31,12 +40,19 @@ impl Config {
         self.expansion_factor = factor;
         self
     }
+
+    /// Enable or disable automatic rebuilds.
+    pub fn auto_rebuild(mut self, enabled: bool) -> Self {
+        self.auto_rebuild = enabled;
+        self
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             expansion_factor: 2.0,
+            auto_rebuild: true,
         }
     }
 }

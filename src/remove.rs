@@ -1,28 +1,59 @@
-//! Remove algorithm for the learned index.
+//! Lock-free remove algorithm with CAS retry loop.
+#![allow(unsafe_code)]
+
+use std::sync::atomic::Ordering;
+
+use crossbeam_epoch::{Guard, Shared};
 
 use crate::key::Key;
-use crate::node::{Node, Slot};
+use crate::node::{Node, SlotInner};
 
-/// Remove a key from the tree, returning the value if it existed.
-pub fn remove<K: Key, V>(node: &mut Node<K, V>, key: &K) -> Option<V> {
-    let slot_idx = node.predict_slot(*key);
+/// Remove a key from the tree, returning `true` if it was found and removed.
+pub fn remove<K: Key, V>(node: &Node<K, V>, key: &K, guard: &Guard) -> bool {
+    let mut current_node = node;
+    loop {
+        let slot_idx = current_node.predict_slot(*key);
+        let slot = current_node.slot(slot_idx);
+        let current = slot.load(Ordering::Acquire, guard);
 
-    match &mut node.slots[slot_idx] {
-        Slot::Empty => None,
-        Slot::Data(k, _) => {
-            if k == key {
-                // Take the slot, replacing with Empty
-                let old = std::mem::replace(&mut node.slots[slot_idx], Slot::Empty);
-                node.num_keys -= 1;
-                match old {
-                    Slot::Data(_, v) => Some(v),
-                    _ => unreachable!(),
+        if current.is_null() {
+            return false;
+        }
+
+        // SAFETY: current is not null and valid for the lifetime of the guard.
+        let inner = unsafe { current.deref() };
+
+        match inner {
+            SlotInner::Data { key: k, .. } => {
+                if k != key {
+                    return false; // different key
                 }
-            } else {
-                None
+                // Found: CAS current → null
+                if slot
+                    .compare_exchange(
+                        current,
+                        Shared::null(),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        guard,
+                    )
+                    .is_ok()
+                {
+                    // SAFETY: CAS succeeded; the old Data is unreachable to
+                    // new readers. Defer destruction until all existing guards
+                    // that may have loaded it are dropped.
+                    unsafe {
+                        guard.defer_destroy(current);
+                    }
+                    current_node.dec_keys();
+                    return true;
+                }
+                // CAS failed — slot changed, retry
+            }
+            SlotInner::Child(child) => {
+                current_node = child;
             }
         }
-        Slot::Child(child) => remove(child, key),
     }
 }
 
@@ -30,57 +61,84 @@ pub fn remove<K: Key, V>(node: &mut Node<K, V>, key: &K) -> Option<V> {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::insert;
+
+    use crossbeam_epoch as epoch;
+
+    fn guard() -> epoch::Guard {
+        epoch::pin()
+    }
 
     #[test]
     fn remove_existing_key() {
+        let g = guard();
         let pairs = vec![(10u64, "a"), (20, "b"), (30, "c")];
-        let mut node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
+        let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
 
-        let removed = remove(&mut node, &20);
-        assert_eq!(removed, Some("b"));
-        assert_eq!(node.total_keys(), 2);
-        assert_eq!(crate::lookup::get(&node, &20), None);
+        let removed = remove(&node, &20, &g);
+        assert!(removed);
+        assert_eq!(node.total_keys(&g), 2);
+        assert_eq!(crate::lookup::get(&node, &20, &g), None);
     }
 
     #[test]
     fn remove_missing_key() {
+        let g = guard();
         let pairs = vec![(10u64, "a"), (20, "b")];
-        let mut node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
+        let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
 
-        let removed = remove(&mut node, &99);
-        assert!(removed.is_none());
-        assert_eq!(node.total_keys(), 2);
+        let removed = remove(&node, &99, &g);
+        assert!(!removed);
+        assert_eq!(node.total_keys(&g), 2);
     }
 
     #[test]
     fn remove_all_keys() {
+        let g = guard();
         let pairs = vec![(1u64, 'a'), (2, 'b'), (3, 'c')];
-        let mut node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
+        let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
 
-        assert_eq!(remove(&mut node, &1), Some('a'));
-        assert_eq!(remove(&mut node, &2), Some('b'));
-        assert_eq!(remove(&mut node, &3), Some('c'));
-        assert_eq!(node.total_keys(), 0);
+        assert!(remove(&node, &1, &g));
+        assert!(remove(&node, &2, &g));
+        assert!(remove(&node, &3, &g));
+        assert_eq!(node.total_keys(&g), 0);
     }
 
     #[test]
     fn remove_then_reinsert() {
+        let g = guard();
         let pairs = vec![(10u64, "a"), (20, "b")];
-        let mut node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
+        let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
 
-        remove(&mut node, &10);
-        assert_eq!(crate::lookup::get(&node, &10), None);
+        remove(&node, &10, &g);
+        assert_eq!(crate::lookup::get(&node, &10, &g), None);
 
-        crate::insert::insert(&mut node, 10, "A");
-        assert_eq!(crate::lookup::get(&node, &10), Some(&"A"));
+        insert::insert(&node, 10, &"A", &g);
+        assert_eq!(crate::lookup::get(&node, &10, &g), Some(&"A"));
     }
 
     #[test]
     fn remove_idempotent() {
+        let g = guard();
         let pairs = vec![(5u64, "x")];
-        let mut node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
+        let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
 
-        assert_eq!(remove(&mut node, &5), Some("x"));
-        assert_eq!(remove(&mut node, &5), None);
+        assert!(remove(&node, &5, &g));
+        assert!(!remove(&node, &5, &g));
+    }
+
+    #[test]
+    fn remove_from_child_node() {
+        let g = guard();
+        let pairs: Vec<(u64, &str)> = vec![(10, "a"), (20, "b")];
+        let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
+
+        // Insert a key that may create a child
+        insert::insert(&node, 15, &"c", &g);
+        assert_eq!(node.total_keys(&g), 3);
+
+        // Remove from within the child structure
+        assert!(remove(&node, &15, &g));
+        assert_eq!(crate::lookup::get(&node, &15, &g), None);
     }
 }
