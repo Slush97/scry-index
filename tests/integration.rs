@@ -1,5 +1,7 @@
 //! End-to-end integration tests for the scry-index Phase 2 concurrent API.
 
+use std::collections::BTreeMap;
+
 use scry_index::{Config, Error, LearnedMap, LearnedSet};
 
 // ---------------------------------------------------------------------------
@@ -494,4 +496,156 @@ fn set_large_insert_remove() {
             assert!(set.contains(&i, &g));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Range queries (Phase 3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn range_on_empty_map() {
+    let map = LearnedMap::<u64, u64>::new();
+    let g = map.guard();
+    let items: Vec<_> = map.range(0..100, &g).collect();
+    assert!(items.is_empty());
+}
+
+#[test]
+fn range_full_matches_iter_sorted() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in (0..200u64).rev() {
+        map.insert(i, i * 10, &g);
+    }
+    let from_range: Vec<(u64, u64)> = map.range(.., &g).map(|(&k, &v)| (k, v)).collect();
+    let from_sorted = map.iter_sorted(&g);
+    assert_eq!(from_range, from_sorted);
+}
+
+#[test]
+fn range_bounded_matches_btreemap() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    let mut oracle = BTreeMap::new();
+    for i in 0..1000u64 {
+        let key = i.wrapping_mul(2_654_435_761) % 50_000;
+        map.insert(key, key, &g);
+        oracle.insert(key, key);
+    }
+
+    // Test several range bounds
+    let ranges: Vec<std::ops::Range<u64>> = vec![0..100, 1000..5000, 10_000..20_000, 49_000..50_001];
+    for r in ranges {
+        let map_keys: Vec<u64> = map.range(r.clone(), &g).map(|(k, _)| *k).collect();
+        let btree_keys: Vec<u64> = oracle.range(r.clone()).map(|(k, _)| *k).collect();
+        assert_eq!(map_keys, btree_keys, "mismatch for range {r:?}");
+    }
+}
+
+#[test]
+fn range_with_removed_keys() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in 0..100u64 {
+        map.insert(i, i, &g);
+    }
+    // Remove even keys in range 20..40
+    for i in (20..40u64).step_by(2) {
+        map.remove(&i, &g);
+    }
+
+    let items: Vec<u64> = map.range(20..40, &g).map(|(k, _)| *k).collect();
+    // Only odd keys 21,23,...,39 should remain
+    let expected: Vec<u64> = (21..40).step_by(2).collect();
+    assert_eq!(items, expected);
+}
+
+#[test]
+fn range_various_bound_types() {
+    let pairs: Vec<(u64, u64)> = (0..50).map(|i| (i, i)).collect();
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+
+    // ..
+    assert_eq!(map.range(.., &g).count(), 50);
+    // a..b
+    assert_eq!(map.range(10..20, &g).count(), 10);
+    // a..=b
+    assert_eq!(map.range(10..=20, &g).count(), 11);
+    // a..
+    assert_eq!(map.range(40.., &g).count(), 10);
+    // ..b
+    assert_eq!(map.range(..10, &g).count(), 10);
+    // ..=b
+    assert_eq!(map.range(..=10, &g).count(), 11);
+}
+
+#[test]
+fn first_last_key_value() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+
+    // Empty map
+    assert!(map.first_key_value(&g).is_none());
+    assert!(map.last_key_value(&g).is_none());
+
+    for i in (0..100u64).rev() {
+        map.insert(i * 3, i, &g);
+    }
+
+    let sorted = map.iter_sorted(&g);
+    let first = map.first_key_value(&g).unwrap();
+    let last = map.last_key_value(&g).unwrap();
+
+    assert_eq!(*first.0, sorted.first().unwrap().0);
+    assert_eq!(*last.0, sorted.last().unwrap().0);
+}
+
+#[test]
+fn set_range_and_first_last() {
+    let keys: Vec<u64> = (0..100).collect();
+    let set = LearnedSet::bulk_load(&keys).unwrap();
+    let g = set.guard();
+
+    // first / last
+    assert_eq!(set.first(&g), Some(&0u64));
+    assert_eq!(set.last(&g), Some(&99u64));
+
+    // range
+    let range_keys: Vec<u64> = set.range(10..=20, &g).copied().collect();
+    assert_eq!(range_keys, (10..=20).collect::<Vec<_>>());
+}
+
+#[test]
+fn map_ref_range_and_first_last() {
+    let map = LearnedMap::new();
+    let m = map.pin();
+    for i in 0..50u64 {
+        m.insert(i, i * 10);
+    }
+
+    let first = m.first_key_value().unwrap();
+    assert_eq!(*first.0, 0);
+    let last = m.last_key_value().unwrap();
+    assert_eq!(*last.0, 49);
+
+    let range_keys: Vec<u64> = m.range(10..20).map(|(k, _)| *k).collect();
+    assert_eq!(range_keys, (10..20).collect::<Vec<_>>());
+
+    assert_eq!(m.range_count(10..20), 10);
+}
+
+#[test]
+fn set_ref_range_and_first_last() {
+    let set = LearnedSet::new();
+    let s = set.pin();
+    for i in 0..50u64 {
+        s.insert(i);
+    }
+
+    assert_eq!(s.first(), Some(&0u64));
+    assert_eq!(s.last(), Some(&49u64));
+
+    let range_keys: Vec<u64> = s.range(10..20).copied().collect();
+    assert_eq!(range_keys, (10..20).collect::<Vec<_>>());
 }

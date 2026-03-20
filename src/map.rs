@@ -9,7 +9,9 @@ use crate::build;
 use crate::config::Config;
 use crate::error::Result;
 use crate::insert::{self, InsertResult};
-use crate::iter::{self, Iter};
+use std::ops::RangeBounds;
+
+use crate::iter::{self, Iter, Range};
 use crate::key::Key;
 use crate::lookup;
 use crate::model::LinearModel;
@@ -85,15 +87,35 @@ impl<K: Key, V: Clone + Send + Sync> MapRef<'_, K, V> {
         self.map.is_empty()
     }
 
-    /// Iterate over all key-value pairs (DFS order, not necessarily sorted).
+    /// Iterate over all key-value pairs in sorted order.
     #[allow(clippy::iter_without_into_iter)]
     pub fn iter(&self) -> Iter<'_, K, V> {
         self.map.iter(&self.guard)
     }
 
-    /// Collect all key-value pairs in sorted order.
+    /// Collect all key-value pairs in sorted order (cloned).
     pub fn iter_sorted(&self) -> Vec<(K, V)> {
         self.map.iter_sorted(&self.guard)
+    }
+
+    /// Return an iterator over key-value pairs within the given range.
+    pub fn range<R: RangeBounds<K>>(&self, range: R) -> Range<'_, K, V> {
+        self.map.range(range, &self.guard)
+    }
+
+    /// Return the first (minimum) key-value pair.
+    pub fn first_key_value(&self) -> Option<(&K, &V)> {
+        self.map.first_key_value(&self.guard)
+    }
+
+    /// Return the last (maximum) key-value pair.
+    pub fn last_key_value(&self) -> Option<(&K, &V)> {
+        self.map.last_key_value(&self.guard)
+    }
+
+    /// Count the number of entries within the given range.
+    pub fn range_count<R: RangeBounds<K>>(&self, range: R) -> usize {
+        self.map.range_count(range, &self.guard)
     }
 
     /// Return the maximum depth of the tree.
@@ -136,8 +158,6 @@ impl<K: Key, V: Clone + Send + Sync> MapRef<'_, K, V> {
 pub struct LearnedMap<K: Key, V> {
     root: Atomic<Node<K, V>>,
     len: AtomicUsize,
-    /// Number of inserts since last rebuild. Used to trigger auto-rebuild.
-    inserts_since_rebuild: AtomicUsize,
     config: Config,
 }
 
@@ -162,7 +182,6 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         Self {
             root: root_atomic,
             len: AtomicUsize::new(0),
-            inserts_since_rebuild: AtomicUsize::new(0),
             config,
         }
     }
@@ -189,7 +208,6 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         let root_atomic = Atomic::new(root);
         Ok(Self {
             len: AtomicUsize::new(pairs.len()),
-            inserts_since_rebuild: AtomicUsize::new(0),
             root: root_atomic,
             config,
         })
@@ -227,43 +245,20 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
 
     /// Insert a key-value pair. Returns `true` if the key was newly inserted,
     /// `false` if an existing key's value was updated.
+    ///
+    /// When `auto_rebuild` is enabled, the insert path tracks descent depth
+    /// and triggers a localized subtree rebuild if the depth exceeds the
+    /// configured threshold. No global lock is required.
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
         let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
         // SAFETY: root is always non-null.
         let root = unsafe { root_shared.deref() };
-        let result = insert::insert(root, key, &value, &guard.inner);
+        let result = insert::insert(root, key, &value, &self.config, &guard.inner);
         if result == InsertResult::Inserted {
-            let new_len = self.len.fetch_add(1, Ordering::Relaxed) + 1;
-            self.maybe_rebuild(new_len, guard);
+            self.len.fetch_add(1, Ordering::Relaxed);
             true
         } else {
             false
-        }
-    }
-
-    /// Check if the tree should be rebuilt based on insert pressure.
-    ///
-    /// Uses a CAS on the counter to ensure only one thread triggers rebuild
-    /// per threshold crossing.
-    fn maybe_rebuild(&self, len: usize, guard: &Guard) {
-        if !self.config.auto_rebuild {
-            return;
-        }
-        let count = self.inserts_since_rebuild.fetch_add(1, Ordering::Relaxed) + 1;
-        // Rebuild every ~25% of current size, capped at 256 to bound pile-up
-        // depth. Keys inserted beyond the model's fitted range pile up at the
-        // boundary slot, so pile-up depth equals inserts since last rebuild.
-        // The cap ensures depth never exceeds ~256 between rebuilds.
-        let threshold = (len / 4).clamp(16, 256);
-        if count >= threshold {
-            // CAS to zero — only the winner triggers rebuild
-            if self
-                .inserts_since_rebuild
-                .compare_exchange(count, 0, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                self.rebuild(guard);
-            }
         }
     }
 
@@ -297,7 +292,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         self.len() == 0
     }
 
-    /// Iterate over all key-value pairs (DFS order, not necessarily sorted).
+    /// Iterate over all key-value pairs in sorted order.
     ///
     /// The returned references are valid for the lifetime of the guard.
     pub fn iter<'g>(&self, guard: &'g Guard) -> Iter<'g, K, V> {
@@ -307,14 +302,48 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         Iter::new(root, &guard.inner)
     }
 
-    /// Collect all key-value pairs in sorted order.
+    /// Collect all key-value pairs in sorted order (cloned).
     ///
-    /// Performs a full traversal, clones all entries, and sorts the results.
+    /// Performs a full traversal and clones all entries.
     pub fn iter_sorted(&self, guard: &Guard) -> Vec<(K, V)> {
         let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
         // SAFETY: root is always non-null.
         let root = unsafe { root_shared.deref() };
         iter::sorted_pairs(root, &guard.inner)
+    }
+
+    /// Return an iterator over key-value pairs within the given range.
+    ///
+    /// The iterator yields entries in ascending key order. Uses model-guided
+    /// seek for efficient initialization when a start bound is provided.
+    ///
+    /// Accepts any range syntax: `a..b`, `a..=b`, `a..`, `..b`, `..=b`, `..`.
+    pub fn range<'g, R: RangeBounds<K>>(&self, range: R, guard: &'g Guard) -> Range<'g, K, V> {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        // SAFETY: root is always non-null.
+        let root = unsafe { root_shared.deref() };
+        Range::new(root, range, &guard.inner)
+    }
+
+    /// Return the first (minimum) key-value pair in the map.
+    pub fn first_key_value<'g>(&self, guard: &'g Guard) -> Option<(&'g K, &'g V)> {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        // SAFETY: root is always non-null.
+        let root = unsafe { root_shared.deref() };
+        iter::first_entry(root, &guard.inner)
+    }
+
+    /// Return the last (maximum) key-value pair in the map.
+    pub fn last_key_value<'g>(&self, guard: &'g Guard) -> Option<(&'g K, &'g V)> {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        // SAFETY: root is always non-null.
+        let root = unsafe { root_shared.deref() };
+        iter::last_entry(root, &guard.inner)
+    }
+
+    /// Count the number of entries within the given range.
+    pub fn range_count<R: RangeBounds<K>>(&self, range: R, guard: &Guard) -> usize {
+        self.range(range, guard).count()
     }
 
     /// Return the maximum depth of the tree.
@@ -333,8 +362,11 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// FMCD model fitting. This compacts the tree and restores O(1) lookups
     /// after many incremental inserts.
     ///
-    /// **Note:** Concurrent writes that occur between the snapshot and the
-    /// root swap may be lost. This is documented behavior for Phase 2.
+    /// This is lock-free: it snapshots the current tree, builds a new one,
+    /// and CAS-swaps the root. Concurrent mutations that land in the old tree
+    /// between the snapshot and the CAS may be lost (same as any lock-free
+    /// compaction). Use for manual compaction when write quiescence is
+    /// acceptable, or rely on the automatic localized rebuilds for online use.
     pub fn rebuild(&self, guard: &Guard) {
         let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
         if root_shared.is_null() {
@@ -368,7 +400,6 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
                 guard.inner.defer_destroy(root_shared);
             }
             self.len.store(pairs.len(), Ordering::Relaxed);
-            self.inserts_since_rebuild.store(0, Ordering::Relaxed);
         }
         // On CAS failure: concurrent modification — our rebuilt tree is
         // discarded (the Owned<Node> in the Err is dropped automatically).

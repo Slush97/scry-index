@@ -22,6 +22,15 @@ pub struct Config {
     ///
     /// Default: `true`.
     pub auto_rebuild: bool,
+
+    /// Maximum subtree depth before a localized rebuild is triggered.
+    ///
+    /// When an insert descends through more child nodes than this threshold,
+    /// the inserting thread rebuilds the degraded subtree inline. Only applies
+    /// when `auto_rebuild` is `true`. Set to `usize::MAX` to disable.
+    ///
+    /// Default: `8`.
+    pub rebuild_depth_threshold: usize,
 }
 
 impl Config {
@@ -46,6 +55,12 @@ impl Config {
         self.auto_rebuild = enabled;
         self
     }
+
+    /// Set the maximum subtree depth before localized rebuild triggers.
+    pub fn rebuild_depth_threshold(mut self, threshold: usize) -> Self {
+        self.rebuild_depth_threshold = threshold;
+        self
+    }
 }
 
 impl Default for Config {
@@ -53,6 +68,7 @@ impl Default for Config {
         Self {
             expansion_factor: 2.0,
             auto_rebuild: true,
+            rebuild_depth_threshold: 8,
         }
     }
 }

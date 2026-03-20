@@ -113,7 +113,7 @@ mod tests {
         remove(&node, &10, &g);
         assert_eq!(crate::lookup::get(&node, &10, &g), None);
 
-        insert::insert(&node, 10, &"A", &g);
+        insert::insert(&node, 10, &"A", &Config::default(), &g);
         assert_eq!(crate::lookup::get(&node, &10, &g), Some(&"A"));
     }
 
@@ -134,7 +134,7 @@ mod tests {
         let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
 
         // Insert a key that may create a child
-        insert::insert(&node, 15, &"c", &g);
+        insert::insert(&node, 15, &"c", &Config::default(), &g);
         assert_eq!(node.total_keys(&g), 3);
 
         // Remove from within the child structure

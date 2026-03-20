@@ -46,11 +46,13 @@ mod lookup;
 mod map;
 mod model;
 mod node;
+mod rebuild;
 mod remove;
 mod set;
 
 pub use config::Config;
 pub use error::{Error, Result};
+pub use iter::{Iter, Range};
 pub use key::Key;
 pub use map::{Guard, LearnedMap, MapRef};
 pub use set::{LearnedSet, SetRef};

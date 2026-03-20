@@ -1,5 +1,7 @@
 //! A sorted set backed by a learned index.
 
+use std::ops::RangeBounds;
+
 use crate::config::Config;
 use crate::error::Result;
 use crate::key::Key;
@@ -44,6 +46,21 @@ impl<K: Key> SetRef<'_, K> {
     /// Return `true` if the set is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Return an iterator over keys within the given range, in ascending order.
+    pub fn range<R: RangeBounds<K>>(&self, range: R) -> impl Iterator<Item = &K> {
+        self.inner.range(range).map(|(k, ())| k)
+    }
+
+    /// Return the first (minimum) key.
+    pub fn first(&self) -> Option<&K> {
+        self.inner.first_key_value().map(|(k, ())| k)
+    }
+
+    /// Return the last (maximum) key.
+    pub fn last(&self) -> Option<&K> {
+        self.inner.last_key_value().map(|(k, ())| k)
     }
 }
 
@@ -109,6 +126,25 @@ impl<K: Key> LearnedSet<K> {
     /// Return `true` if the set is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    /// Return an iterator over keys within the given range, in ascending order.
+    pub fn range<'g, R: RangeBounds<K>>(
+        &self,
+        range: R,
+        guard: &'g Guard,
+    ) -> impl Iterator<Item = &'g K> {
+        self.inner.range(range, guard).map(|(k, ())| k)
+    }
+
+    /// Return the first (minimum) key.
+    pub fn first<'g>(&self, guard: &'g Guard) -> Option<&'g K> {
+        self.inner.first_key_value(guard).map(|(k, ())| k)
+    }
+
+    /// Return the last (maximum) key.
+    pub fn last<'g>(&self, guard: &'g Guard) -> Option<&'g K> {
+        self.inner.last_key_value(guard).map(|(k, ())| k)
     }
 }
 

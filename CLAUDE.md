@@ -32,6 +32,7 @@ src/
   build.rs     — bulk-load construction from sorted data
   lookup.rs    — recursive lookup algorithm
   insert.rs    — insert with chain-method conflict resolution
+  rebuild.rs   — localized subtree rebuild via CAS-swap
   remove.rs    — logical deletion
   iter.rs      — in-order DFS iterator, range queries
   map.rs       — LearnedMap<K, V> public API
@@ -42,12 +43,21 @@ src/
 
 ### Phased Implementation
 
-- **Phase 1 (current)**: Single-threaded. No atomics. Validate FMCD, lookup, insert,
+- **Phase 1 (done)**: Single-threaded. No atomics. Validate FMCD, lookup, insert,
   iterator. All methods take `&mut self`.
-- **Phase 2**: Concurrent. Atomic slots, lock-free reads, per-slot write locks,
-  epoch-based reclamation. All methods take `&self`.
-- **Phase 3**: SALI node evolving strategies (hot/cold nodes, adaptive rebuilding).
-- **Phase 4**: Polish, range queries, benchmarks, crates.io publish.
+- **Phase 2 (done)**: Concurrent. Atomic slots, lock-free reads, CAS-based writes,
+  epoch-based reclamation. All methods take `&self`. Auto-rebuild heuristic.
+- **Phase 2.5 (done → superseded by Phase 4)**: `RwLock<()>` rebuild guard
+  was removed in Phase 4. Localized subtree rebuilds replaced the global lock.
+- **Phase 3 (done)**: O(n) in-order iteration (DFS is naturally sorted — removed
+  unnecessary sort). Range queries: `range(start..end)`, `first_key_value()`,
+  `last_key_value()`, `range_count()`. Model-guided seek for O(depth) range init.
+- **Phase 4 (done)**: Depth-triggered localized subtree rebuilds. Insert tracks
+  descent depth; when it exceeds `rebuild_depth_threshold` (default 8), the
+  inserting thread rebuilds the degraded subtree inline via CAS-swap. Replaced
+  Phase 2.5 `RwLock` with fully lock-free operation. Global `rebuild()` remains
+  as explicit lock-free compaction API.
+- **Phase 5**: Polish, benchmarks tuning, documentation, crates.io publish.
 
 ## Code Conventions
 

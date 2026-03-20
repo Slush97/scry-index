@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering;
 
 use crossbeam_epoch::{self as epoch, Guard, Owned};
 
+use crate::config::Config;
 use crate::key::Key;
 use crate::model::LinearModel;
 use crate::node::{Node, SlotInner};
@@ -29,13 +30,21 @@ pub enum InsertResult {
 ///
 /// Returns [`InsertResult::Inserted`] if the key was new, or
 /// [`InsertResult::Updated`] if an existing key's value was replaced.
+///
+/// When `config.auto_rebuild` is enabled, tracks descent depth and triggers
+/// a localized subtree rebuild if the depth exceeds
+/// `config.rebuild_depth_threshold`.
 pub fn insert<K: Key, V: Clone + Send + Sync>(
     node: &Node<K, V>,
     key: K,
     value: &V,
+    config: &Config,
     guard: &Guard,
 ) -> InsertResult {
     let mut current_node = node;
+    let mut depth: usize = 0;
+    let mut rebuild_candidate: Option<(&Node<K, V>, usize)> = None;
+
     loop {
         let slot_idx = current_node.predict_slot(key);
         let slot = current_node.slot(slot_idx);
@@ -53,6 +62,14 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                 .is_ok()
             {
                 current_node.inc_keys();
+                // Only rebuild if depth exceeded the threshold — the subtree
+                // actually degraded beyond the capture point. Rebuilding when
+                // depth == threshold wastes work on already-compact subtrees.
+                if config.auto_rebuild && depth > config.rebuild_depth_threshold {
+                    if let Some((parent, idx)) = rebuild_candidate {
+                        crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
+                    }
+                }
                 return InsertResult::Inserted;
             }
             continue;
@@ -91,7 +108,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                 // Collision: build child containing both entries, CAS old → Child
                 let ek = *existing_key;
                 let ev = existing_value.clone();
-                let child = build_conflict_node(ek, ev, key, value.clone());
+                let child = build_conflict_node(ek, ev, key, value.clone(), config);
                 let new = Owned::new(SlotInner::Child(child));
                 if slot
                     .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire, guard)
@@ -102,11 +119,24 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                         guard.defer_destroy(current);
                     }
                     current_node.dec_keys(); // existing data moved to child
+                    if config.auto_rebuild && depth > config.rebuild_depth_threshold {
+                        if let Some((parent, idx)) = rebuild_candidate {
+                            crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
+                        }
+                    }
                     return InsertResult::Inserted;
                 }
                 // CAS failed — slot changed, retry
             }
             SlotInner::Child(child) => {
+                depth += 1;
+                // Capture the shallowest child on the descent path. If depth
+                // eventually exceeds the threshold, we rebuild from this point,
+                // flattening the entire degraded chain — not just a small
+                // subtree deep in the tree.
+                if rebuild_candidate.is_none() {
+                    rebuild_candidate = Some((current_node, slot_idx));
+                }
                 current_node = child;
             }
         }
@@ -123,6 +153,7 @@ fn build_conflict_node<K: Key, V: Clone + Send + Sync>(
     v1: V,
     k2: K,
     v2: V,
+    config: &Config,
 ) -> Node<K, V> {
     let (lo_k, lo_v, hi_k, hi_v) = if k1 < k2 {
         (k1, v1, k2, v2)
@@ -165,9 +196,10 @@ fn build_conflict_node<K: Key, V: Clone + Send + Sync>(
         // (with unprotected guard since this is single-threaded construction).
         // SAFETY: Exclusive access during construction. The unprotected guard
         // is safe because no concurrent readers exist for this node yet.
+        // Depth is 1 at most, so the rebuild threshold never triggers.
         unsafe {
             let guard = epoch::unprotected();
-            insert(&node, hi_k, &hi_v, guard);
+            insert(&node, hi_k, &hi_v, config, guard);
         }
     } else {
         node.store_slot(
@@ -194,6 +226,10 @@ mod tests {
         epoch::pin()
     }
 
+    fn cfg() -> Config {
+        Config::default()
+    }
+
     fn empty_root() -> Node<u64, u64> {
         let model = LinearModel::new(0.1, 0.0);
         Node::with_capacity(model, 100)
@@ -203,7 +239,7 @@ mod tests {
     fn insert_into_empty_slot() {
         let g = guard();
         let node = empty_root();
-        let result = insert(&node, 50, &500, &g);
+        let result = insert(&node, 50, &500, &cfg(), &g);
         assert_eq!(result, InsertResult::Inserted);
         assert_eq!(node.total_keys(&g), 1);
     }
@@ -212,8 +248,8 @@ mod tests {
     fn insert_duplicate_returns_updated() {
         let g = guard();
         let node = empty_root();
-        insert(&node, 50, &500, &g);
-        let result = insert(&node, 50, &5000, &g);
+        insert(&node, 50, &500, &cfg(), &g);
+        let result = insert(&node, 50, &5000, &cfg(), &g);
         assert_eq!(result, InsertResult::Updated);
         assert_eq!(node.total_keys(&g), 1);
     }
@@ -225,7 +261,7 @@ mod tests {
         let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
         let initial_keys = node.total_keys(&g);
 
-        insert(&node, 15, &"c", &g);
+        insert(&node, 15, &"c", &cfg(), &g);
         assert_eq!(node.total_keys(&g), initial_keys + 1);
 
         assert_eq!(crate::lookup::get(&node, &10, &g), Some(&"a"));
@@ -236,9 +272,10 @@ mod tests {
     #[test]
     fn insert_many_sequential() {
         let g = guard();
+        let c = cfg();
         let node = empty_root();
         for i in 0..100u64 {
-            insert(&node, i, &i, &g);
+            insert(&node, i, &i, &c, &g);
         }
         assert_eq!(node.total_keys(&g), 100);
         for i in 0..100u64 {
@@ -253,9 +290,10 @@ mod tests {
     #[test]
     fn insert_reverse_order() {
         let g = guard();
+        let c = cfg();
         let node = empty_root();
         for i in (0..50u64).rev() {
-            insert(&node, i, &(i * 10), &g);
+            insert(&node, i, &(i * 10), &c, &g);
         }
         assert_eq!(node.total_keys(&g), 50);
         for i in 0..50u64 {
@@ -266,13 +304,14 @@ mod tests {
     #[test]
     fn insert_update_preserves_count() {
         let g = guard();
+        let c = cfg();
         let node = empty_root();
-        insert(&node, 1, &10, &g);
-        insert(&node, 2, &20, &g);
-        insert(&node, 3, &30, &g);
+        insert(&node, 1, &10, &c, &g);
+        insert(&node, 2, &20, &c, &g);
+        insert(&node, 3, &30, &c, &g);
         assert_eq!(node.total_keys(&g), 3);
 
-        insert(&node, 2, &200, &g);
+        insert(&node, 2, &200, &c, &g);
         assert_eq!(node.total_keys(&g), 3);
         assert_eq!(crate::lookup::get(&node, &2, &g), Some(&200));
     }
@@ -280,11 +319,12 @@ mod tests {
     #[test]
     fn insert_into_bulk_loaded_tree() {
         let g = guard();
+        let c = cfg();
         let pairs: Vec<(u64, u64)> = (0..100).map(|i| (i * 2, i)).collect();
         let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
 
         for i in 0..100u64 {
-            insert(&node, i * 2 + 1, &(i + 1000), &g);
+            insert(&node, i * 2 + 1, &(i + 1000), &c, &g);
         }
 
         assert_eq!(node.total_keys(&g), 200);
@@ -300,7 +340,7 @@ mod tests {
     #[test]
     fn conflict_node_is_small() {
         let g = guard();
-        let node = build_conflict_node(10u64, "a", 20u64, "b");
+        let node = build_conflict_node(10u64, "a", 20u64, "b", &cfg());
         assert_eq!(node.capacity(), 4);
         assert_eq!(node.total_keys(&g), 2);
     }
@@ -308,7 +348,7 @@ mod tests {
     #[test]
     fn conflict_node_both_findable() {
         let g = guard();
-        let node = build_conflict_node(100u64, 1, 200u64, 2);
+        let node = build_conflict_node(100u64, 1, 200u64, 2, &cfg());
         assert_eq!(crate::lookup::get(&node, &100, &g), Some(&1));
         assert_eq!(crate::lookup::get(&node, &200, &g), Some(&2));
     }
@@ -316,19 +356,49 @@ mod tests {
     #[test]
     fn insert_update_returns_correct_result() {
         let g = guard();
+        let c = cfg();
         let node = empty_root();
-        assert_eq!(insert(&node, 1, &10, &g), InsertResult::Inserted);
-        assert_eq!(insert(&node, 1, &20, &g), InsertResult::Updated);
-        assert_eq!(insert(&node, 2, &30, &g), InsertResult::Inserted);
+        assert_eq!(insert(&node, 1, &10, &c, &g), InsertResult::Inserted);
+        assert_eq!(insert(&node, 1, &20, &c, &g), InsertResult::Updated);
+        assert_eq!(insert(&node, 2, &30, &c, &g), InsertResult::Inserted);
     }
 
     #[test]
     fn insert_value_is_updated() {
         let g = guard();
+        let c = cfg();
         let node = empty_root();
-        insert(&node, 42, &100, &g);
+        insert(&node, 42, &100, &c, &g);
         assert_eq!(crate::lookup::get(&node, &42, &g), Some(&100));
-        insert(&node, 42, &999, &g);
+        insert(&node, 42, &999, &c, &g);
         assert_eq!(crate::lookup::get(&node, &42, &g), Some(&999));
+    }
+
+    #[test]
+    fn insert_triggers_localized_rebuild() {
+        let g = guard();
+        let config = Config::new().rebuild_depth_threshold(4);
+        let node = empty_root();
+
+        // Insert keys that pile up in the 100-slot node, creating deep chains
+        for i in 0..50u64 {
+            insert(&node, i, &(i * 10), &config, &g);
+        }
+
+        // With threshold 4, localized rebuilds should keep depth bounded
+        let depth = node.max_depth(&g);
+        assert!(
+            depth <= 10,
+            "depth {depth} too high with rebuild_depth_threshold=4"
+        );
+
+        // All keys should still be present
+        for i in 0..50u64 {
+            assert_eq!(
+                crate::lookup::get(&node, &i, &g),
+                Some(&(i * 10)),
+                "key {i} missing after localized rebuild"
+            );
+        }
     }
 }

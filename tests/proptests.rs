@@ -5,6 +5,11 @@ use std::collections::BTreeMap;
 
 use scry_index::{Config, LearnedMap, LearnedSet};
 
+/// Generate a random range bound pair (lo, hi) with lo <= hi within [0, max].
+fn random_bounds(max: u64) -> impl Strategy<Value = (u64, u64)> {
+    (0..max, 0..max).prop_map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
+}
+
 // ---------------------------------------------------------------------------
 // Strategies
 // ---------------------------------------------------------------------------
@@ -317,5 +322,70 @@ proptest! {
         for (&k, &v) in &oracle {
             prop_assert_eq!(map.get(&k, &g), Some(&v));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Iter sortedness (Phase 3)
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn iter_is_sorted_prop(keys in unique_keys(300)) {
+        let map = LearnedMap::new();
+        let g = map.guard();
+        for &k in &keys {
+            map.insert(k, k, &g);
+        }
+
+        let items: Vec<u64> = map.iter(&g).map(|(k, _)| *k).collect();
+        prop_assert_eq!(items.len(), keys.len());
+        for w in items.windows(2) {
+            prop_assert!(w[0] < w[1], "not sorted: {} >= {}", w[0], w[1]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Range matches BTreeMap
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn range_matches_btreemap_range(
+        keys in unique_keys(200),
+        bounds in random_bounds(100_000),
+    ) {
+        let map = LearnedMap::new();
+        let g = map.guard();
+        let mut oracle = BTreeMap::new();
+        for &k in &keys {
+            map.insert(k, k, &g);
+            oracle.insert(k, k);
+        }
+
+        let (lo, hi) = bounds;
+        let map_keys: Vec<u64> = map.range(lo..=hi, &g).map(|(k, _)| *k).collect();
+        let btree_keys: Vec<u64> = oracle.range(lo..=hi).map(|(k, _)| *k).collect();
+        prop_assert_eq!(map_keys, btree_keys);
+    }
+
+    #[test]
+    fn first_last_match_btreemap(keys in unique_keys(200)) {
+        let map = LearnedMap::new();
+        let g = map.guard();
+        let mut oracle = BTreeMap::new();
+        for &k in &keys {
+            map.insert(k, k, &g);
+            oracle.insert(k, k);
+        }
+
+        let map_first = map.first_key_value(&g).map(|(k, _)| *k);
+        let btree_first = oracle.keys().next().copied();
+        prop_assert_eq!(map_first, btree_first);
+
+        let map_last = map.last_key_value(&g).map(|(k, _)| *k);
+        let btree_last = oracle.keys().next_back().copied();
+        prop_assert_eq!(map_last, btree_last);
     }
 }

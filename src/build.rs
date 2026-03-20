@@ -31,7 +31,7 @@ pub fn bulk_load<K: Key, V: Clone>(pairs: &[(K, V)], config: &Config) -> Result<
 }
 
 /// Recursively build a subtree from a sorted slice of key-value pairs.
-fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Config) -> Node<K, V> {
+pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Config) -> Node<K, V> {
     let keys: Vec<K> = pairs.iter().map(|(k, _)| *k).collect();
     let result = fit_fmcd(&keys, config.expansion_factor);
 
