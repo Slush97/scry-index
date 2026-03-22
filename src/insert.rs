@@ -166,15 +166,18 @@ fn build_conflict_node<K: Key, V: Clone + Send + Sync>(
     // Use a 4-slot array: map lo to slot 0, hi to slot 3
     let array_size = 4;
 
-    let (slope, intercept) = if key_range.abs() < f64::EPSILON {
-        // Same model input (shouldn't happen for distinct integer keys) — stack them
-        (0.0, 0.0)
+    let model = if key_range.abs() < f64::EPSILON {
+        // Keys have the same f64 representation (precision loss for large
+        // integers). Use exact ordinal comparison to separate them.
+        let lo_ord = lo_k.to_exact_ordinal();
+        let hi_ord = hi_k.to_exact_ordinal();
+        let midpoint = lo_ord + (hi_ord - lo_ord) / 2;
+        LinearModel::binary_split(midpoint)
     } else {
         let s = (array_size - 1) as f64 / key_range;
-        (s, -s * lo_f)
+        LinearModel::new(s, -s * lo_f)
     };
 
-    let model = LinearModel::new(slope, intercept);
     let node = Node::with_capacity(model, array_size);
 
     let s1 = node.predict_slot(lo_k);
@@ -370,6 +373,36 @@ mod tests {
         assert_eq!(crate::lookup::get(&node, &42, &g), Some(&100));
         insert(&node, 42, &999, &c, &g);
         assert_eq!(crate::lookup::get(&node, &42, &g), Some(&999));
+    }
+
+    #[test]
+    fn conflict_node_same_f64_keys() {
+        let g = guard();
+        let base: u64 = 1_700_000_000_000_000_000;
+        assert_eq!(base as f64, (base + 1) as f64, "precondition: same f64");
+        let node = build_conflict_node(base, "a", base + 1, "b", &cfg());
+        assert_eq!(node.total_keys(&g), 2);
+        assert_eq!(crate::lookup::get(&node, &base, &g), Some(&"a"));
+        assert_eq!(crate::lookup::get(&node, &(base + 1), &g), Some(&"b"));
+    }
+
+    #[test]
+    fn conflict_node_many_same_f64_keys() {
+        let g = guard();
+        let c = cfg();
+        let base: u64 = 1_700_000_000_000_000_000;
+        let node = empty_root();
+        for i in 0..20u64 {
+            insert(&node, base + i, &(base + i), &c, &g);
+        }
+        assert_eq!(node.total_keys(&g), 20);
+        for i in 0..20u64 {
+            assert_eq!(
+                crate::lookup::get(&node, &(base + i), &g),
+                Some(&(base + i)),
+                "key base+{i} not found"
+            );
+        }
     }
 
     #[test]

@@ -658,3 +658,134 @@ fn set_ref_range_and_first_last() {
     let range_keys: Vec<u64> = s.range(10..20).copied().collect();
     assert_eq!(range_keys, (10..20).collect::<Vec<_>>());
 }
+
+// ---------------------------------------------------------------------------
+// f64 precision: keys with identical f64 representation (regression tests)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn insert_u64_keys_same_f64() {
+    let base: u64 = 1_700_000_000_000_000_000;
+    let k1 = base;
+    let k2 = base + 1;
+    assert_eq!(k1 as f64, k2 as f64, "precondition: keys must share f64");
+
+    let map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(k1, "first", &g);
+    map.insert(k2, "second", &g);
+
+    assert_eq!(map.len(), 2);
+    assert_eq!(map.get(&k1, &g), Some(&"first"));
+    assert_eq!(map.get(&k2, &g), Some(&"second"));
+}
+
+#[test]
+fn insert_many_u64_keys_same_f64() {
+    let base: u64 = 1_700_000_000_000_000_000;
+    let n = 100u64;
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in 0..n {
+        map.insert(base + i, i, &g);
+    }
+    assert_eq!(map.len(), n as usize);
+    for i in 0..n {
+        assert_eq!(
+            map.get(&(base + i), &g),
+            Some(&i),
+            "missing key base+{i}"
+        );
+    }
+}
+
+#[test]
+fn bulk_load_u64_keys_same_f64() {
+    let base: u64 = 1_700_000_000_000_000_000;
+    let pairs: Vec<(u64, u64)> = (0..50).map(|i| (base + i, i)).collect();
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+    assert_eq!(map.len(), 50);
+    for (k, v) in &pairs {
+        assert_eq!(map.get(k, &g), Some(v), "missing key {k}");
+    }
+}
+
+#[test]
+fn remove_from_same_f64_keys() {
+    let base: u64 = 1_700_000_000_000_000_000;
+    let map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(base, 1u64, &g);
+    map.insert(base + 1, 2, &g);
+    assert!(map.remove(&base, &g));
+    assert_eq!(map.get(&base, &g), None);
+    assert_eq!(map.get(&(base + 1), &g), Some(&2));
+    assert_eq!(map.len(), 1);
+}
+
+#[test]
+fn iter_sorted_with_same_f64_keys() {
+    let base: u64 = 1_700_000_000_000_000_000;
+    let pairs: Vec<(u64, u64)> = (0..20).map(|i| (base + i, i)).collect();
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+    let sorted = map.iter_sorted(&g);
+    assert_eq!(sorted.len(), 20);
+    for w in sorted.windows(2) {
+        assert!(w[0].0 < w[1].0, "not sorted: {} >= {}", w[0].0, w[1].0);
+    }
+}
+
+#[test]
+fn rebuild_with_same_f64_keys() {
+    let base: u64 = 1_700_000_000_000_000_000;
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in 0..50u64 {
+        map.insert(base + i, i, &g);
+    }
+    map.rebuild(&g);
+    let g2 = map.guard();
+    for i in 0..50u64 {
+        assert_eq!(
+            map.get(&(base + i), &g2),
+            Some(&i),
+            "key base+{i} lost after rebuild"
+        );
+    }
+}
+
+#[test]
+fn mixed_normal_and_degenerate_keys() {
+    let base: u64 = 1_700_000_000_000_000_000;
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in 0..100u64 {
+        map.insert(i, i, &g);
+    }
+    for i in 0..20u64 {
+        map.insert(base + i, i + 1000, &g);
+    }
+    assert_eq!(map.len(), 120);
+    for i in 0..100u64 {
+        assert_eq!(map.get(&i, &g), Some(&i));
+    }
+    for i in 0..20u64 {
+        assert_eq!(map.get(&(base + i), &g), Some(&(i + 1000)));
+    }
+}
+
+#[test]
+fn update_value_same_f64_keys() {
+    let base: u64 = 1_700_000_000_000_000_000;
+    let map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(base, 1u64, &g);
+    map.insert(base + 1, 2, &g);
+    // Update existing key
+    assert!(!map.insert(base, 99, &g));
+    assert_eq!(map.get(&base, &g), Some(&99));
+    assert_eq!(map.get(&(base + 1), &g), Some(&2));
+    assert_eq!(map.len(), 2);
+}

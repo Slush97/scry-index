@@ -11,18 +11,41 @@ use crate::key::Key;
 ///
 /// Given a key `k`, the predicted slot index is:
 /// `(slope * k.to_model_input() + intercept).round() as usize`
+///
+/// When `midpoint` is set, the linear formula is overridden with a binary
+/// split: keys with `to_exact_ordinal() <= midpoint` predict to slot 0,
+/// keys above predict to the last slot. This handles the degenerate case
+/// where `f64` cannot distinguish two distinct keys.
 #[derive(Debug, Clone, Copy)]
 pub struct LinearModel {
     /// Slope of the linear function.
     pub slope: f64,
     /// Intercept of the linear function.
     pub intercept: f64,
+    /// When set, overrides linear prediction with a binary split.
+    midpoint: Option<i128>,
 }
 
 impl LinearModel {
     /// Create a new linear model with the given parameters.
     pub const fn new(slope: f64, intercept: f64) -> Self {
-        Self { slope, intercept }
+        Self {
+            slope,
+            intercept,
+            midpoint: None,
+        }
+    }
+
+    /// Create a binary-split model that separates keys at the given midpoint.
+    ///
+    /// Keys with `to_exact_ordinal() <= midpoint` predict to slot 0;
+    /// keys above predict to `array_size - 1`.
+    pub const fn binary_split(midpoint: i128) -> Self {
+        Self {
+            slope: 0.0,
+            intercept: 0.0,
+            midpoint: Some(midpoint),
+        }
     }
 
     /// Predict the slot index for a key.
@@ -30,6 +53,13 @@ impl LinearModel {
     /// Returns the predicted position clamped to `[0, array_size - 1]`.
     #[inline]
     pub fn predict<K: Key>(&self, key: K, array_size: usize) -> usize {
+        if let Some(mid) = self.midpoint {
+            return if key.to_exact_ordinal() <= mid {
+                0
+            } else {
+                array_size.saturating_sub(1)
+            };
+        }
         let pos = self.slope.mul_add(key.to_model_input(), self.intercept);
         let pos = pos.round().max(0.0) as usize;
         pos.min(array_size.saturating_sub(1))
@@ -40,6 +70,7 @@ impl LinearModel {
         Self {
             slope: 0.0,
             intercept: 0.0,
+            midpoint: None,
         }
     }
 }
@@ -261,6 +292,38 @@ mod tests {
                 pair[0],
                 pair[1]
             );
+        }
+    }
+
+    #[test]
+    fn binary_split_separates_keys() {
+        let base: u64 = 1_700_000_000_000_000_000;
+        let lo_ord = base.to_exact_ordinal();
+        let hi_ord = (base + 1).to_exact_ordinal();
+        let midpoint = lo_ord + (hi_ord - lo_ord) / 2;
+        let model = LinearModel::binary_split(midpoint);
+
+        // array_size = 2: should map lo to 0, hi to 1
+        assert_eq!(model.predict(base, 2), 0);
+        assert_eq!(model.predict(base + 1, 2), 1);
+
+        // array_size = 4: should map lo to 0, hi to 3
+        assert_eq!(model.predict(base, 4), 0);
+        assert_eq!(model.predict(base + 1, 4), 3);
+    }
+
+    #[test]
+    fn binary_split_many_keys() {
+        let base: u64 = 1_700_000_000_000_000_000;
+        // Split at midpoint between base+4 and base+5
+        let mid = base.to_exact_ordinal() + 4;
+        let model = LinearModel::binary_split(mid);
+
+        for i in 0..=4u64 {
+            assert_eq!(model.predict(base + i, 2), 0, "base+{i} should go to slot 0");
+        }
+        for i in 5..10u64 {
+            assert_eq!(model.predict(base + i, 2), 1, "base+{i} should go to slot 1");
         }
     }
 

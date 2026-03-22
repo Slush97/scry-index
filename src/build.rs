@@ -4,7 +4,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::key::Key;
-use crate::model::fit_fmcd;
+use crate::model::{fit_fmcd, LinearModel};
 use crate::node::{Node, SlotInner};
 
 /// Build a learned index tree from sorted key-value pairs.
@@ -33,6 +33,20 @@ pub fn bulk_load<K: Key, V: Clone>(pairs: &[(K, V)], config: &Config) -> Result<
 /// Recursively build a subtree from a sorted slice of key-value pairs.
 pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Config) -> Node<K, V> {
     let keys: Vec<K> = pairs.iter().map(|(k, _)| *k).collect();
+    let n = keys.len();
+
+    // Check for degenerate case: all keys share the same f64 model input.
+    // This happens for integer keys above 2^53 where f64 precision is lost.
+    // Without this check, fit_fmcd produces slope=0 and all keys collide,
+    // causing infinite recursion.
+    if n > 1 {
+        let first_f = keys[0].to_model_input();
+        let last_f = keys[n - 1].to_model_input();
+        if (last_f - first_f).abs() < f64::EPSILON {
+            return build_degenerate(pairs);
+        }
+    }
+
     let result = fit_fmcd(&keys, config.expansion_factor);
 
     let node = Node::with_capacity(result.model, result.array_size);
@@ -87,10 +101,91 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
                         (*k, v.clone())
                     })
                     .collect();
-                let child = build_recursive(&child_pairs, config);
+                // Check if this conflict group is degenerate (all same f64).
+                let child = if is_degenerate_group(&child_pairs) {
+                    build_degenerate(&child_pairs)
+                } else {
+                    build_recursive(&child_pairs, config)
+                };
                 node.store_slot(slot_idx, SlotInner::Child(child));
             }
         }
+    }
+
+    node
+}
+
+/// Check if all keys in a group have the same f64 model input.
+fn is_degenerate_group<K: Key, V>(pairs: &[(K, V)]) -> bool {
+    if pairs.len() <= 1 {
+        return false;
+    }
+    let first_f = pairs[0].0.to_model_input();
+    let last_f = pairs[pairs.len() - 1].0.to_model_input();
+    (last_f - first_f).abs() < f64::EPSILON
+}
+
+/// Build a balanced binary tree for keys that share the same f64 representation.
+///
+/// Uses midpoint binary splits via `to_exact_ordinal` at each level. Guaranteed
+/// to terminate because each split halves the key count and `to_exact_ordinal`
+/// is injective (distinct keys always get different ordinals).
+///
+/// Pairs must be sorted by key (invariant from `bulk_load`).
+fn build_degenerate<K: Key, V: Clone>(pairs: &[(K, V)]) -> Node<K, V> {
+    debug_assert!(!pairs.is_empty());
+
+    if pairs.len() == 1 {
+        let node = Node::with_capacity(LinearModel::constant(), 1);
+        node.store_slot(
+            0,
+            SlotInner::Data {
+                key: pairs[0].0,
+                value: pairs[0].1.clone(),
+            },
+        );
+        node.inc_keys();
+        return node;
+    }
+
+    // Split at median. Pairs are sorted, so left half < right half.
+    let mid_idx = pairs.len() / 2;
+    let lo_half = &pairs[..mid_idx];
+    let hi_half = &pairs[mid_idx..];
+
+    let lo_last_ord = lo_half.last().unwrap().0.to_exact_ordinal();
+    let hi_first_ord = hi_half.first().unwrap().0.to_exact_ordinal();
+    let midpoint = lo_last_ord + (hi_first_ord - lo_last_ord) / 2;
+
+    let model = LinearModel::binary_split(midpoint);
+    let node = Node::with_capacity(model, 2);
+
+    if lo_half.len() == 1 {
+        node.store_slot(
+            0,
+            SlotInner::Data {
+                key: lo_half[0].0,
+                value: lo_half[0].1.clone(),
+            },
+        );
+        node.inc_keys();
+    } else {
+        let child = build_degenerate(lo_half);
+        node.store_slot(0, SlotInner::Child(child));
+    }
+
+    if hi_half.len() == 1 {
+        node.store_slot(
+            1,
+            SlotInner::Data {
+                key: hi_half[0].0,
+                value: hi_half[0].1.clone(),
+            },
+        );
+        node.inc_keys();
+    } else {
+        let child = build_degenerate(hi_half);
+        node.store_slot(1, SlotInner::Child(child));
     }
 
     node
@@ -168,5 +263,48 @@ mod tests {
         let pairs: Vec<(i64, &str)> = vec![(-100, "neg"), (0, "zero"), (100, "pos")];
         let node = bulk_load(&pairs, &default_config()).unwrap();
         assert_eq!(node.total_keys(&g), 3);
+    }
+
+    #[test]
+    fn bulk_load_same_f64_keys() {
+        let g = guard();
+        let base: u64 = 1_700_000_000_000_000_000;
+        let pairs: Vec<(u64, u64)> = (0..20).map(|i| (base + i, i)).collect();
+        let node = bulk_load(&pairs, &default_config()).unwrap();
+        assert_eq!(node.total_keys(&g), 20);
+        for (k, v) in &pairs {
+            assert_eq!(
+                crate::lookup::get(&node, k, &g),
+                Some(v),
+                "missing key {k}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_degenerate_two_keys() {
+        let g = guard();
+        let base: u64 = 1_700_000_000_000_000_000;
+        let pairs = vec![(base, 1u64), (base + 1, 2)];
+        let node = build_degenerate(&pairs);
+        assert_eq!(node.total_keys(&g), 2);
+        assert_eq!(crate::lookup::get(&node, &base, &g), Some(&1));
+        assert_eq!(crate::lookup::get(&node, &(base + 1), &g), Some(&2));
+    }
+
+    #[test]
+    fn build_degenerate_many_keys() {
+        let g = guard();
+        let base: u64 = 1_700_000_000_000_000_000;
+        let pairs: Vec<(u64, u64)> = (0..50).map(|i| (base + i, i)).collect();
+        let node = build_degenerate(&pairs);
+        assert_eq!(node.total_keys(&g), 50);
+        for (k, v) in &pairs {
+            assert_eq!(
+                crate::lookup::get(&node, k, &g),
+                Some(v),
+                "missing key {k}"
+            );
+        }
     }
 }
