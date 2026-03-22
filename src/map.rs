@@ -422,7 +422,14 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             return;
         }
 
-        let Ok(new_root) = build::bulk_load(&pairs, &self.config) else {
+        // Root rebuilds use range headroom so the model covers beyond the
+        // current key range. Without this, all keys inserted after the rebuild
+        // that exceed the training range clamp to the last slot.
+        let rebuild_config = Config {
+            range_headroom: 1.0,
+            ..self.config.clone()
+        };
+        let Ok(new_root) = build::bulk_load(&pairs, &rebuild_config) else {
             return;
         };
         let new_owned = Owned::new(new_root);

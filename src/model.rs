@@ -86,22 +86,32 @@ pub struct FmcdResult {
     pub conflicts: usize,
 }
 
+/// Maximum number of candidate slopes to try in FMCD.
+const MAX_FMCD_CANDIDATES: usize = 128;
+
 /// Fit a linear model to sorted keys using the FMCD algorithm.
 ///
-/// The algorithm finds a linear function that maps each key to a unique slot
-/// in an array of size `keys.len() * expansion_factor`. The expansion factor
-/// controls how many gaps (empty slots) are left for future inserts.
+/// Finds a linear function `f(key) = slope * key + intercept` that maps each
+/// key to a slot in an array, minimizing the number of collisions (conflicts).
+///
+/// The algorithm tries candidate slopes derived from the maximum inter-key gap
+/// (the FMCD heuristic from the LIPP paper) and selects the slope with the
+/// fewest conflicts. Linear interpolation is always tried as a baseline.
 ///
 /// # Arguments
 ///
 /// - `keys`: Sorted slice of keys (must be non-empty and sorted).
 /// - `expansion_factor`: Ratio of array size to number of keys. Must be >= 1.0.
 ///   A factor of 2.0 means the array is twice as large as the key count (50% gaps).
+/// - `range_headroom`: Extra key range coverage beyond the current data. When > 0,
+///   the model covers `(1 + range_headroom)` times the actual key range and the
+///   array grows proportionally, leaving space for future keys beyond the current
+///   max without clamping. Must be >= 0.0.
 ///
 /// # Returns
 ///
 /// A [`FmcdResult`] containing the model, array size, and conflict count.
-pub fn fit_fmcd<K: Key>(keys: &[K], expansion_factor: f64) -> FmcdResult {
+pub fn fit_fmcd<K: Key>(keys: &[K], expansion_factor: f64, range_headroom: f64) -> FmcdResult {
     assert!(!keys.is_empty(), "keys must be non-empty");
     assert!(
         expansion_factor >= 1.0,
@@ -119,38 +129,81 @@ pub fn fit_fmcd<K: Key>(keys: &[K], expansion_factor: f64) -> FmcdResult {
         };
     }
 
-    let array_size = (n as f64 * expansion_factor).ceil().max(n as f64) as usize;
+    let headroom_mult = 1.0 + range_headroom;
+    let array_size = (n as f64 * expansion_factor * headroom_mult)
+        .ceil()
+        .max(n as f64) as usize;
 
     let first = keys[0].to_model_input();
     let last = keys[n - 1].to_model_input();
     let key_range = last - first;
 
-    let (slope, intercept) = if key_range.abs() < f64::EPSILON {
+    if key_range.abs() < f64::EPSILON {
         // All keys are the same value — map all to the middle
-        (0.0, (array_size / 2) as f64)
-    } else {
-        // Linear interpolation: map first key to 0, last key to array_size - 1
-        let s = (array_size - 1) as f64 / key_range;
-        let i = -s * first;
-        (s, i)
-    };
+        return FmcdResult {
+            model: LinearModel::new(0.0, (array_size / 2) as f64),
+            array_size,
+            conflicts: n - 1,
+        };
+    }
 
-    let model = LinearModel::new(slope, intercept);
+    let effective_range = key_range * headroom_mult;
 
-    // Fast path: for sorted keys with expansion >= 2.0 and uniform-ish spacing,
-    // conflicts are rare. Check monotonicity of predictions first — if each key
-    // maps to a strictly increasing slot, there are zero conflicts without needing
-    // the full O(array_size) allocation for conflict counting.
-    let conflicts = if expansion_factor >= 1.5 && n > 2 {
-        count_conflicts_fast(keys, &model, array_size)
-    } else {
-        count_conflicts(keys, &model, array_size)
-    };
+    // --- Candidate 1: Linear interpolation (baseline) ---
+    let lin_slope = (array_size - 1) as f64 / effective_range;
+    let lin_intercept = -lin_slope * first;
+    let lin_model = LinearModel::new(lin_slope, lin_intercept);
+    let lin_conflicts = count_conflicts_fast(keys, &lin_model, array_size);
+
+    if lin_conflicts == 0 {
+        return FmcdResult {
+            model: lin_model,
+            array_size,
+            conflicts: 0,
+        };
+    }
+
+    let mut best_model = lin_model;
+    let mut best_conflicts = lin_conflicts;
+
+    // --- FMCD: try slopes derived from the maximum inter-key gap ---
+    // The insight: the optimal slope often places the widest-gap pair at
+    // consecutive slots. Trying multiples of 1/max_gap efficiently searches
+    // for the minimum-conflict model.
+    let mut max_gap = 0.0_f64;
+    for pair in keys.windows(2) {
+        let gap = pair[1].to_model_input() - pair[0].to_model_input();
+        max_gap = max_gap.max(gap);
+    }
+
+    if max_gap > f64::EPSILON {
+        // Upper bound: slope where predict(last) = array_size - 1
+        let max_slope = (array_size - 1) as f64 / key_range;
+
+        for j in 1..=MAX_FMCD_CANDIDATES {
+            let slope = j as f64 / max_gap;
+            if slope > max_slope {
+                break;
+            }
+
+            let intercept = -slope * first;
+            let model = LinearModel::new(slope, intercept);
+            let conflicts = count_conflicts_fast(keys, &model, array_size);
+
+            if conflicts < best_conflicts {
+                best_conflicts = conflicts;
+                best_model = model;
+            }
+            if best_conflicts == 0 {
+                break;
+            }
+        }
+    }
 
     FmcdResult {
-        model,
+        model: best_model,
         array_size,
-        conflicts,
+        conflicts: best_conflicts,
     }
 }
 
@@ -173,8 +226,8 @@ fn count_conflicts_fast<K: Key>(keys: &[K], model: &LinearModel, array_size: usi
 
 /// Count how many keys collide (map to the same slot).
 ///
-/// Full version: allocates a boolean array. Needed when keys are not sorted
-/// or expansion factor is very tight.
+/// Full version: allocates a boolean array. Works for unsorted keys.
+#[cfg(test)]
 fn count_conflicts<K: Key>(keys: &[K], model: &LinearModel, array_size: usize) -> usize {
     let mut occupied = vec![false; array_size];
     let mut conflicts = 0;
@@ -195,7 +248,7 @@ mod tests {
 
     #[test]
     fn single_key() {
-        let result = fit_fmcd(&[42u64], 2.0);
+        let result = fit_fmcd(&[42u64], 2.0, 0.0);
         assert_eq!(result.array_size, 1);
         assert_eq!(result.conflicts, 0);
         assert_eq!(result.model.predict(42u64, 1), 0);
@@ -203,7 +256,7 @@ mod tests {
 
     #[test]
     fn two_keys() {
-        let result = fit_fmcd(&[10u64, 20], 2.0);
+        let result = fit_fmcd(&[10u64, 20], 2.0, 0.0);
         assert_eq!(result.conflicts, 0);
         assert!(result.array_size >= 2);
         let s1 = result.model.predict(10u64, result.array_size);
@@ -214,7 +267,7 @@ mod tests {
     #[test]
     fn sequential_keys_no_conflicts() {
         let keys: Vec<u64> = (0..100).collect();
-        let result = fit_fmcd(&keys, 2.0);
+        let result = fit_fmcd(&keys, 2.0, 0.0);
         assert_eq!(
             result.conflicts, 0,
             "sequential keys with 2x expansion should have zero conflicts"
@@ -224,7 +277,7 @@ mod tests {
     #[test]
     fn dense_keys_some_conflicts() {
         let keys: Vec<u64> = vec![1, 2, 3, 100, 200, 300];
-        let result = fit_fmcd(&keys, 1.0);
+        let result = fit_fmcd(&keys, 1.0, 0.0);
         assert!(result.array_size >= keys.len());
     }
 
@@ -239,48 +292,48 @@ mod tests {
     #[test]
     fn expansion_factor_affects_size() {
         let keys: Vec<u64> = (0..50).collect();
-        let r1 = fit_fmcd(&keys, 1.5);
-        let r2 = fit_fmcd(&keys, 3.0);
+        let r1 = fit_fmcd(&keys, 1.5, 0.0);
+        let r2 = fit_fmcd(&keys, 3.0, 0.0);
         assert!(r2.array_size > r1.array_size);
     }
 
     #[test]
     fn identical_keys_handled() {
         let keys = vec![5u64; 10];
-        let result = fit_fmcd(&keys, 2.0);
+        let result = fit_fmcd(&keys, 2.0, 0.0);
         assert_eq!(result.conflicts, 9);
     }
 
     #[test]
     fn large_key_range() {
         let keys = vec![0u64, u64::MAX / 2];
-        let result = fit_fmcd(&keys, 2.0);
+        let result = fit_fmcd(&keys, 2.0, 0.0);
         assert_eq!(result.conflicts, 0);
     }
 
     #[test]
     fn signed_keys() {
         let keys: Vec<i64> = vec![-100, -50, 0, 50, 100];
-        let result = fit_fmcd(&keys, 2.0);
+        let result = fit_fmcd(&keys, 2.0, 0.0);
         assert_eq!(result.conflicts, 0);
     }
 
     #[test]
     #[should_panic(expected = "keys must be non-empty")]
     fn empty_keys_panics() {
-        fit_fmcd::<u64>(&[], 2.0);
+        fit_fmcd::<u64>(&[], 2.0, 0.0);
     }
 
     #[test]
     #[should_panic(expected = "expansion_factor must be >= 1.0")]
     fn bad_expansion_panics() {
-        fit_fmcd(&[1u64, 2, 3], 0.5);
+        fit_fmcd(&[1u64, 2, 3], 0.5, 0.0);
     }
 
     #[test]
     fn model_monotonic_for_sorted_keys() {
         let keys: Vec<u64> = (0..1000).map(|i| i * 7 + 3).collect();
-        let result = fit_fmcd(&keys, 2.0);
+        let result = fit_fmcd(&keys, 2.0, 0.0);
         let positions: Vec<usize> = keys
             .iter()
             .map(|&k| result.model.predict(k, result.array_size))
@@ -344,5 +397,56 @@ mod tests {
             fast, full,
             "fast ({fast}) and full ({full}) conflict counts disagree"
         );
+    }
+
+    #[test]
+    fn fmcd_reduces_conflicts_for_nonuniform_keys() {
+        // Non-uniform spacing where FMCD can find a better slope than
+        // linear interpolation. Keys with varying gaps benefit from
+        // slope optimization.
+        let keys: Vec<u64> = vec![0, 1, 2, 3, 10, 11, 12, 13, 20, 21];
+        let result = fit_fmcd(&keys, 2.0, 0.0);
+        assert!(
+            result.conflicts <= 2,
+            "FMCD should achieve <= 2 conflicts for mildly clustered keys, got {}",
+            result.conflicts
+        );
+    }
+
+    #[test]
+    fn headroom_increases_array_size() {
+        let keys: Vec<u64> = (0..100).collect();
+        let r0 = fit_fmcd(&keys, 2.0, 0.0);
+        let r1 = fit_fmcd(&keys, 2.0, 1.0);
+        assert!(
+            r1.array_size > r0.array_size,
+            "headroom=1.0 should produce larger array: {} vs {}",
+            r1.array_size,
+            r0.array_size
+        );
+    }
+
+    #[test]
+    fn headroom_keys_not_at_edge() {
+        let keys: Vec<u64> = (0..100).collect();
+        let result = fit_fmcd(&keys, 2.0, 1.0);
+        // With headroom=1.0, the last key should map to approximately
+        // the middle of the array, not the end.
+        let last_slot = result.model.predict(99u64, result.array_size);
+        let midpoint = result.array_size / 2;
+        assert!(
+            last_slot <= midpoint + midpoint / 4,
+            "last key at slot {last_slot}, expected near {midpoint} (array_size={})",
+            result.array_size
+        );
+    }
+
+    #[test]
+    fn uniform_still_zero_conflicts_with_fmcd() {
+        // Regression guard: sequential keys with good expansion should
+        // still get 0 conflicts after the FMCD rewrite.
+        let keys: Vec<u64> = (0..1000).collect();
+        let result = fit_fmcd(&keys, 2.0, 0.0);
+        assert_eq!(result.conflicts, 0, "sequential keys should have 0 conflicts");
     }
 }

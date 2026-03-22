@@ -47,7 +47,7 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
         }
     }
 
-    let result = fit_fmcd(&keys, config.expansion_factor);
+    let result = fit_fmcd(&keys, config.expansion_factor, config.range_headroom);
 
     let node = Node::with_capacity(result.model, result.array_size);
 

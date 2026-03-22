@@ -789,3 +789,69 @@ fn update_value_same_f64_keys() {
     assert_eq!(map.get(&(base + 1), &g), Some(&2));
     assert_eq!(map.len(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// Model quality: FMCD + range headroom
+// ---------------------------------------------------------------------------
+
+#[test]
+fn headroom_prevents_edge_pileup() {
+    // Insert 200 keys to trigger root rebuilds, then insert 200 more
+    // beyond the original range. With headroom, the second batch should
+    // NOT all pile up in the last slot.
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in 0..200u64 {
+        map.insert(i, i, &g);
+    }
+    // Root has been rebuilt (threshold 64, 128). Now insert beyond range.
+    let g2 = map.guard();
+    for i in 200..400u64 {
+        map.insert(i, i, &g2);
+    }
+    let g3 = map.guard();
+    assert_eq!(map.len(), 400);
+    let depth = map.max_depth(&g3);
+    assert!(
+        depth <= 12,
+        "depth {depth} too high — headroom should prevent edge pile-up"
+    );
+    for i in 0..400u64 {
+        assert_eq!(map.get(&i, &g3), Some(&i), "key {i} missing");
+    }
+}
+
+#[test]
+fn clustered_keys_bulk_load_shallow() {
+    // Two clusters far apart. FMCD should fit a model that separates them
+    // cleanly, producing a shallow tree.
+    let mut pairs: Vec<(u64, u64)> = (0..50).map(|i| (i, i)).collect();
+    pairs.extend((0..50).map(|i| (1_000_000 + i, i + 50)));
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+    let depth = map.max_depth(&g);
+    assert!(
+        depth <= 3,
+        "depth {depth} too high for clustered bulk-loaded data"
+    );
+    assert_eq!(map.len(), 100);
+}
+
+#[test]
+fn incremental_insert_1000_from_empty() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in 0..1000u64 {
+        map.insert(i, i, &g);
+    }
+    let g2 = map.guard();
+    assert_eq!(map.len(), 1000);
+    let depth = map.max_depth(&g2);
+    assert!(
+        depth <= 12,
+        "depth {depth} too high for 1000 sequential inserts from empty"
+    );
+    for i in 0..1000u64 {
+        assert_eq!(map.get(&i, &g2), Some(&i), "key {i} missing");
+    }
+}

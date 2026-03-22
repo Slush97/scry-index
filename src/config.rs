@@ -31,6 +31,18 @@ pub struct Config {
     ///
     /// Default: `8`.
     pub rebuild_depth_threshold: usize,
+
+    /// Extra key range headroom for model fitting.
+    ///
+    /// When greater than 0, the model covers `(1 + range_headroom)` times the
+    /// actual key range, leaving space for keys beyond the current max. This
+    /// prevents all out-of-range keys from clamping to the last slot.
+    ///
+    /// The array size grows proportionally to maintain per-key slot density.
+    /// Only applies during model fitting (bulk load and rebuild).
+    ///
+    /// Default: `0.0` (no headroom). Root rebuilds internally use `1.0`.
+    pub range_headroom: f64,
 }
 
 impl Config {
@@ -61,6 +73,17 @@ impl Config {
         self.rebuild_depth_threshold = threshold;
         self
     }
+
+    /// Set the key range headroom for model fitting.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `headroom < 0.0`.
+    pub fn range_headroom(mut self, headroom: f64) -> Self {
+        assert!(headroom >= 0.0, "range_headroom must be >= 0.0");
+        self.range_headroom = headroom;
+        self
+    }
 }
 
 impl Default for Config {
@@ -69,6 +92,7 @@ impl Default for Config {
             expansion_factor: 2.0,
             auto_rebuild: true,
             rebuild_depth_threshold: 8,
+            range_headroom: 0.0,
         }
     }
 }
