@@ -218,7 +218,14 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     ///
     /// Returns an error if `pairs` is empty or not sorted by key.
     pub fn bulk_load_with_config(pairs: &[(K, V)], config: Config) -> Result<Self> {
-        let root = build::bulk_load(pairs, &config)?;
+        // Build with headroom so appends beyond the loaded range don't all
+        // clamp to the last slot. This is the most common pattern: bulk_load
+        // historical data, then stream new entries.
+        let build_config = Config {
+            range_headroom: config.range_headroom.max(1.0),
+            ..config.clone()
+        };
+        let root = build::bulk_load(pairs, &build_config)?;
         let root_atomic = Atomic::new(root);
         let next_threshold = pairs.len().saturating_mul(ROOT_REBUILD_GROWTH_FACTOR);
         Ok(Self {
