@@ -26,7 +26,7 @@ Based on LIPP's "chain method" (Mod.+C strategy) from the SALI paper (SIGMOD 202
 ```
 src/
   lib.rs       — crate root, re-exports
-  key.rs       — Key trait (Copy + Ord + to_model_input)
+  key.rs       — Key trait (Copy + Ord + to_model_input + to_exact_ordinal)
   model.rs     — LinearModel, FMCD fitting algorithm
   node.rs      — Node<K, V> struct, slot types
   build.rs     — bulk-load construction from sorted data
@@ -57,7 +57,32 @@ src/
   inserting thread rebuilds the degraded subtree inline via CAS-swap. Replaced
   Phase 2.5 `RwLock` with fully lock-free operation. Global `rebuild()` remains
   as explicit lock-free compaction API.
-- **Phase 5**: Polish, benchmarks tuning, documentation, crates.io publish.
+- **Phase 5**: Production hardening. Three sub-phases:
+  - **5a — Model & efficiency**: Replace linear-interpolation fitting with true
+    FMCD (candidate slope iteration to minimize conflicts). Adaptive root sizing
+    so insert-from-empty doesn't degrade to 350x slower than BTreeMap (auto-grow
+    the root array based on first N inserts, or require `bulk_load` for optimal
+    init). Per-entry memory overhead audit — current heap alloc per slot via
+    `Atomic<SlotInner>` causes poor cache locality vs BTreeMap's contiguous nodes;
+    explore arena-based slot storage. Add `size_hint` to iterators.
+  - **5b — Key generalization & API gaps**: Relax `Key: Copy` to support
+    `[u8; N]`, fixed-size byte arrays, and eventually `AsRef<[u8]>` key types.
+    This is the single biggest blocker for real-world adoption (no strings, UUIDs,
+    or compound keys today). Add `entry` API / `get_or_insert` for atomic
+    check-and-insert. Add `clear()` / `drain()`. `bulk_load` variant that
+    deduplicates instead of rejecting duplicates. Make `len()` exact under
+    concurrency or clearly document the approximation on `MapRef::len()`.
+  - **5c — Durability & operational readiness**: Rebuild-under-concurrency must
+    not silently drop writes — add a retry-on-CAS-failure mode or document the
+    write-quiescence requirement. Tombstone compaction for remove-heavy workloads
+    (remove currently nulls slots permanently with no reclamation until explicit
+    rebuild). Memory estimation API (`allocated_bytes()`). Optional `serde`
+    serialization behind a feature flag. Documentation, benchmarks tuning,
+    crates.io publish.
+  - **Phase 4.5 (done)**: Fixed stack overflow for keys with identical f64
+    representations (u64 above 2^53, nanosecond timestamps). Added
+    `Key::to_exact_ordinal() -> i128` and `LinearModel::binary_split()` for
+    degenerate conflict resolution.
 
 ## Code Conventions
 

@@ -18,6 +18,17 @@ use crate::model::LinearModel;
 use crate::node::Node;
 use crate::remove;
 
+/// Number of entries at which the first automatic root rebuild triggers.
+/// 64 entries gives FMCD enough data points for a good model fit.
+const INITIAL_ROOT_REBUILD_THRESHOLD: usize = 64;
+
+/// Growth factor between successive root rebuild thresholds.
+/// Schedule: 64, 128, 256, 512, 1024, 2048, ...
+/// Total amortized rebuild cost: sum of geometric series ≈ 2N = O(N).
+/// Using 2x (not 4x) keeps the root model fresh — critical because keys
+/// outside the model's fitted range all clamp to the last slot.
+const ROOT_REBUILD_GROWTH_FACTOR: usize = 2;
+
 /// An epoch guard that keeps the current thread pinned.
 ///
 /// While a guard exists, any memory retired during this epoch will not be
@@ -159,6 +170,8 @@ pub struct LearnedMap<K: Key, V> {
     root: Atomic<Node<K, V>>,
     len: AtomicUsize,
     config: Config,
+    /// Entry count at which the next automatic root rebuild triggers.
+    next_root_rebuild: AtomicUsize,
 }
 
 impl<K: Key, V> std::fmt::Debug for LearnedMap<K, V> {
@@ -182,6 +195,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         Self {
             root: root_atomic,
             len: AtomicUsize::new(0),
+            next_root_rebuild: AtomicUsize::new(INITIAL_ROOT_REBUILD_THRESHOLD),
             config,
         }
     }
@@ -206,9 +220,11 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     pub fn bulk_load_with_config(pairs: &[(K, V)], config: Config) -> Result<Self> {
         let root = build::bulk_load(pairs, &config)?;
         let root_atomic = Atomic::new(root);
+        let next_threshold = pairs.len().saturating_mul(ROOT_REBUILD_GROWTH_FACTOR);
         Ok(Self {
             len: AtomicUsize::new(pairs.len()),
             root: root_atomic,
+            next_root_rebuild: AtomicUsize::new(next_threshold),
             config,
         })
     }
@@ -255,10 +271,36 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         let root = unsafe { root_shared.deref() };
         let result = insert::insert(root, key, &value, &self.config, &guard.inner);
         if result == InsertResult::Inserted {
-            self.len.fetch_add(1, Ordering::Relaxed);
+            let new_len = self.len.fetch_add(1, Ordering::Relaxed) + 1;
+            self.maybe_rebuild_root(new_len, guard);
             true
         } else {
             false
+        }
+    }
+
+    /// Check if the root should be rebuilt and, if so, claim the rebuild via CAS.
+    ///
+    /// Only one thread wins the CAS on `next_root_rebuild`. The winner performs
+    /// the rebuild inline; all other threads proceed without blocking.
+    fn maybe_rebuild_root(&self, current_len: usize, guard: &Guard) {
+        if !self.config.auto_rebuild {
+            return;
+        }
+
+        let threshold = self.next_root_rebuild.load(Ordering::Relaxed);
+        if current_len < threshold {
+            return;
+        }
+
+        // Try to claim the rebuild by CAS-advancing the threshold.
+        let next_threshold = threshold.saturating_mul(ROOT_REBUILD_GROWTH_FACTOR);
+        if self
+            .next_root_rebuild
+            .compare_exchange(threshold, next_threshold, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.rebuild(guard);
         }
     }
 
@@ -399,7 +441,13 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             unsafe {
                 guard.inner.defer_destroy(root_shared);
             }
-            self.len.store(pairs.len(), Ordering::Relaxed);
+            let count = pairs.len();
+            self.len.store(count, Ordering::Relaxed);
+            // Reset the rebuild schedule relative to the new tree's size.
+            self.next_root_rebuild.store(
+                count.saturating_mul(ROOT_REBUILD_GROWTH_FACTOR),
+                Ordering::Relaxed,
+            );
         }
         // On CAS failure: concurrent modification — our rebuilt tree is
         // discarded (the Owned<Node> in the Err is dropped automatically).
@@ -676,5 +724,65 @@ mod tests {
         m.insert(2, "b");
         let items = m.iter_sorted();
         assert_eq!(items, vec![(1, "a"), (2, "b"), (3, "c")]);
+    }
+
+    #[test]
+    fn auto_root_rebuild_from_empty() {
+        let map = LearnedMap::new();
+        let g = map.guard();
+        for i in 0..200u64 {
+            map.insert(i, i, &g);
+        }
+        let g2 = map.guard();
+        let depth = map.max_depth(&g2);
+        assert!(
+            depth <= 12,
+            "depth {depth} too high after auto root rebuild"
+        );
+        for i in 0..200u64 {
+            assert_eq!(map.get(&i, &g2), Some(&i), "key {i} missing");
+        }
+    }
+
+    #[test]
+    fn auto_root_rebuild_disabled() {
+        let map = LearnedMap::with_config(Config::new().auto_rebuild(false));
+        let g = map.guard();
+        for i in 0..200u64 {
+            map.insert(i, i, &g);
+        }
+        let depth = map.max_depth(&g);
+        assert!(
+            depth > 5,
+            "depth {depth} too low without auto rebuild"
+        );
+    }
+
+    #[test]
+    fn bulk_load_no_early_rebuild() {
+        let pairs: Vec<(u64, u64)> = (0..100).map(|i| (i, i)).collect();
+        let map = LearnedMap::bulk_load(&pairs).unwrap();
+        let g = map.guard();
+        let depth = map.max_depth(&g);
+        assert!(depth <= 3, "bulk-loaded tree depth {depth} too high");
+        assert_eq!(map.len(), 100);
+    }
+
+    #[test]
+    fn manual_rebuild_resets_threshold() {
+        let map = LearnedMap::new();
+        let g = map.guard();
+        for i in 0..50u64 {
+            map.insert(i, i, &g);
+        }
+        map.rebuild(&g);
+        let g2 = map.guard();
+        for i in 50..150u64 {
+            map.insert(i, i, &g2);
+        }
+        assert_eq!(map.len(), 150);
+        for i in 0..150u64 {
+            assert_eq!(map.get(&i, &g2), Some(&i));
+        }
     }
 }
