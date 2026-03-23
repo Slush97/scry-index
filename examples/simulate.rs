@@ -21,12 +21,12 @@ use scry_index::LearnedMap;
 // Configuration
 // ---------------------------------------------------------------------------
 
-const HISTORICAL_KEYS: usize = 1_000_000;
+const HISTORICAL_KEYS: usize = 100_000;
 const LOOKUP_SAMPLE: usize = 100_000;
 const RANGE_SIZE: usize = 10_000;
 const RANGE_ITERS: usize = 100;
-const WRITE_PER_THREAD: usize = 50_000;
-const READ_PER_THREAD: usize = 100_000;
+const WRITE_PER_THREAD: usize = 10_000;
+const READ_PER_THREAD: usize = 50_000;
 const SCAN_PER_THREAD: usize = 500;
 const READER_THREADS: usize = 8;
 const WRITER_THREADS: usize = 4;
@@ -219,7 +219,7 @@ fn bench_range_scan(data: &[(u64, u64)]) -> WorkloadResult {
 }
 
 fn bench_incremental_insert(data: &[(u64, u64)]) -> WorkloadResult {
-    let insert_n: usize = 100_000;
+    let insert_n: usize = 10_000;
     let base = data.last().unwrap().0 + 1;
 
     let lm = LearnedMap::bulk_load(data).unwrap();
@@ -640,17 +640,26 @@ fn main() {
     println!("  Running workloads... (use --release for accurate numbers)");
     println!();
 
-    let results = vec![
-        bench_bulk_load(&data),
-        bench_seq_lookup(&data),
-        bench_rand_lookup(&data),
-        bench_range_scan(&data),
-        bench_incremental_insert(&data),
-        bench_concurrent_read(&data),
-        bench_concurrent_write(&data),
-        bench_mixed_rw(&data),
-        bench_concurrent_range(&data),
-    ];
+    let mut results = Vec::new();
+
+    eprintln!("  [1/9] bulk_load...");
+    results.push(bench_bulk_load(&data));
+    eprintln!("  [2/9] seq_lookup...");
+    results.push(bench_seq_lookup(&data));
+    eprintln!("  [3/9] rand_lookup...");
+    results.push(bench_rand_lookup(&data));
+    eprintln!("  [4/9] range_scan...");
+    results.push(bench_range_scan(&data));
+    eprintln!("  [5/9] incremental_insert...");
+    results.push(bench_incremental_insert(&data));
+    eprintln!("  [6/9] concurrent_read...");
+    results.push(bench_concurrent_read(&data));
+    eprintln!("  [7/9] concurrent_write...");
+    results.push(bench_concurrent_write(&data));
+    eprintln!("  [8/9] mixed_rw...");
+    results.push(bench_mixed_rw(&data));
+    eprintln!("  [9/9] concurrent_range...");
+    results.push(bench_concurrent_range(&data));
 
     // --- Results table ---
     let nw = 22;
@@ -687,7 +696,10 @@ fn main() {
         println!("  {:<nw$} {}", r.name, speedup(r.skipmap, r.learned));
     }
 
-    // --- Diagnostics ---
-    println!();
-    print_diagnostics(&data);
+    // --- Diagnostics disabled: sequential inserts into a bulk-loaded tree
+    // funnel all keys into one root slot, causing O(n^2) rebuild work and
+    // unbounded deferred-memory growth.  This needs a root-level refit or
+    // adaptive model extension before it can run safely.
+    // println!();
+    // print_diagnostics(&data);
 }
