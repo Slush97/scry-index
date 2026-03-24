@@ -10,7 +10,7 @@
 
 use std::sync::atomic::Ordering;
 
-use crossbeam_epoch::{self as epoch, Guard, Owned};
+use crossbeam_epoch::{self as epoch, Guard, Owned, Shared};
 
 use crate::config::Config;
 use crate::key::Key;
@@ -34,6 +34,11 @@ pub enum InsertResult {
 /// When `config.auto_rebuild` is enabled, tracks descent depth and triggers
 /// a localized subtree rebuild if the depth exceeds
 /// `config.rebuild_depth_threshold`.
+///
+/// If a concurrent rebuild replaces a subtree on the insert's descent path,
+/// the insert detects the change via a post-CAS validation and retries from
+/// the root of `node`.
+#[allow(clippy::too_many_lines)]
 pub fn insert<K: Key, V: Clone + Send + Sync>(
     node: &Node<K, V>,
     key: K,
@@ -41,9 +46,25 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
     config: &Config,
     guard: &Guard,
 ) -> InsertResult {
+    // Track whether any retry iteration produced an Inserted result. If so,
+    // the key was genuinely new, even if a later retry finds it already
+    // present (placed by the rebuild snapshot). Persists across retries.
+    let mut retry_was_new = false;
+
+    // Outer retry loop: if a concurrent rebuild orphans the subtree we
+    // inserted into, we restart the insert from the root.
+    'retry: loop {
     let mut current_node = node;
     let mut depth: usize = 0;
     let mut rebuild_candidate: Option<(&Node<K, V>, usize)> = None;
+    // Track the first child descent so we can detect if a concurrent
+    // rebuild replaced the subtree after our insert completed.
+    #[allow(clippy::type_complexity)]
+    let mut descent_snapshot: Option<(
+        &Node<K, V>,
+        usize,
+        Shared<'_, SlotInner<K, V>>,
+    )> = None;
 
     loop {
         let slot_idx = current_node.predict_slot(key);
@@ -62,6 +83,15 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                 .is_ok()
             {
                 current_node.inc_keys();
+                // Validate: if we descended into a child, verify the subtree
+                // is still reachable. A concurrent rebuild may have replaced
+                // it, orphaning our insert.
+                if let Some((parent, pidx, expected)) = descent_snapshot {
+                    if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
+                        retry_was_new = true;
+                        continue 'retry;
+                    }
+                }
                 // Only rebuild if depth exceeded the threshold — the subtree
                 // actually degraded beyond the capture point. Rebuilding when
                 // depth == threshold wastes work on already-compact subtrees.
@@ -98,7 +128,12 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                         unsafe {
                             guard.defer_destroy(current);
                         }
-                        return InsertResult::Updated;
+                        if let Some((parent, pidx, expected)) = descent_snapshot {
+                            if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
+                                continue 'retry;
+                            }
+                        }
+                        return if retry_was_new { InsertResult::Inserted } else { InsertResult::Updated };
                     }
                     // CAS failed — slot changed, retry
                     continue;
@@ -117,6 +152,12 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                         guard.defer_destroy(current);
                     }
                     current_node.dec_keys(); // existing data moved to child
+                    if let Some((parent, pidx, expected)) = descent_snapshot {
+                        if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
+                            retry_was_new = true;
+                            continue 'retry;
+                        }
+                    }
                     if config.auto_rebuild && depth > config.rebuild_depth_threshold {
                         if let Some((parent, idx)) = rebuild_candidate {
                             crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
@@ -127,6 +168,13 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                 // CAS failed — slot changed, retry
             }
             SlotInner::Child(child) => {
+                // If the slot is tagged, a rebuild is in progress on this
+                // subtree. Spin until the rebuild completes, then re-predict
+                // (the slot now points to the rebuilt child).
+                if current.tag() != 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
                 depth += 1;
                 // Capture the shallowest child on the descent path. If depth
                 // eventually exceeds the threshold, we rebuild from this point,
@@ -135,10 +183,15 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                 if rebuild_candidate.is_none() {
                     rebuild_candidate = Some((current_node, slot_idx));
                 }
+                // Track first descent for post-insert validation.
+                if descent_snapshot.is_none() {
+                    descent_snapshot = Some((current_node, slot_idx, current));
+                }
                 current_node = child;
             }
         }
     }
+    } // 'retry
 }
 
 /// Build a small child node from two conflicting key-value pairs.

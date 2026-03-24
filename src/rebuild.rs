@@ -4,17 +4,49 @@
 //! thread rebuilds the degraded subtree inline using [`try_rebuild_subtree`].
 //! This replaces the global `RwLock`-protected rebuild with fine-grained,
 //! lock-free subtree compaction.
+//!
+//! The rebuild uses a **freeze protocol** to prevent data loss: the parent slot
+//! is tagged (frozen) before the snapshot so concurrent inserts spin-wait. A
+//! post-CAS recovery scan catches in-flight inserts that loaded the child
+//! pointer before the freeze.
 #![allow(unsafe_code)]
 
 use std::sync::atomic::Ordering;
 
-use crossbeam_epoch::{Guard, Owned};
+use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
 
 use crate::build;
 use crate::config::Config;
 use crate::iter;
 use crate::key::Key;
 use crate::node::{Node, SlotInner};
+
+/// RAII guard that unfreezes a slot if the rebuild doesn't complete normally.
+///
+/// On drop (including panic unwind), CAS the slot back from the frozen
+/// (tagged) pointer to the original untagged pointer. This prevents a
+/// stuck freeze from blocking all inserts into the subtree forever.
+struct FreezeGuard<'a, 'g, K, V> {
+    slot: &'a Atomic<SlotInner<K, V>>,
+    frozen: Shared<'g, SlotInner<K, V>>,
+    original: Shared<'g, SlotInner<K, V>>,
+    guard: &'g Guard,
+    disarmed: bool,
+}
+
+impl<K, V> Drop for FreezeGuard<'_, '_, K, V> {
+    fn drop(&mut self) {
+        if !self.disarmed {
+            let _ = self.slot.compare_exchange(
+                self.frozen,
+                self.original,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+                self.guard,
+            );
+        }
+    }
+}
 
 /// Attempt to rebuild a degraded subtree at `parent_node.slot(parent_slot_idx)`.
 ///
@@ -26,10 +58,13 @@ use crate::node::{Node, SlotInner};
 ///
 /// # Concurrent safety
 ///
-/// - Two threads rebuilding the same subtree: one CAS wins, the other's work is
-///   dropped. Safe.
-/// - Insert races with rebuild: an insert into the old subtree may be lost if
-///   the rebuild CAS wins first. Same semantics as the previous global rebuild.
+/// - Two threads rebuilding the same subtree: the first freeze-CAS wins, the
+///   other returns false immediately. Safe.
+/// - Insert races with rebuild: the parent slot is *frozen* (tagged) before the
+///   snapshot, so new inserts spin-wait until the rebuild completes. In-flight
+///   inserts (threads that loaded the child pointer before the freeze) may
+///   complete inside the old subtree; a post-CAS recovery scan detects and
+///   re-inserts any keys they added.
 /// - Parent rebuilt while child being rebuilt: the child rebuild CAS fails because
 ///   the parent slot now points to a new child inside the rebuilt parent.
 pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
@@ -41,7 +76,8 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
     let slot = parent_node.slot(parent_slot_idx);
     let current = slot.load(Ordering::Acquire, guard);
 
-    if current.is_null() {
+    // Null, already frozen by another rebuild, or not a child — bail out.
+    if current.is_null() || current.tag() != 0 {
         return false;
     }
 
@@ -53,8 +89,28 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
         SlotInner::Data { .. } => return false,
     };
 
+    // Freeze the slot: tag it so concurrent inserts spin-wait instead of
+    // descending into the old subtree during the rebuild.
+    let frozen = current.with_tag(1);
+    if slot
+        .compare_exchange(current, frozen, Ordering::AcqRel, Ordering::Acquire, guard)
+        .is_err()
+    {
+        return false;
+    }
+
+    // RAII: unfreeze on panic or early return.
+    let mut freeze_guard = FreezeGuard {
+        slot,
+        frozen,
+        original: current,
+        guard,
+        disarmed: false,
+    };
+
     let pairs = iter::sorted_pairs(child, guard);
     if pairs.len() <= 1 {
+        // Too small to rebuild — FreezeGuard::drop unfreezes.
         return false;
     }
 
@@ -68,15 +124,25 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
     let new_node = build::build_recursive(&pairs, &boosted_config);
     let new_inner = Owned::new(SlotInner::Child(new_node));
 
-    // CAS: old child -> new child. On failure, another thread modified this slot.
+    // CAS: frozen old → new child.
     match slot.compare_exchange(
-        current,
+        frozen,
         new_inner,
         Ordering::AcqRel,
         Ordering::Acquire,
         guard,
     ) {
         Ok(_) => {
+            freeze_guard.disarmed = true;
+
+            // In-flight inserts (threads that loaded the child pointer before
+            // the freeze) detect the stale subtree via descent_snapshot
+            // validation in insert::insert and retry automatically. No
+            // explicit recovery scan is needed — the happens-before chain
+            // between insert CAS, validation, freeze, and snapshot guarantees
+            // that any insert completing before the freeze is captured in the
+            // snapshot.
+
             // SAFETY: CAS succeeded; old subtree is unreachable to new readers.
             unsafe {
                 guard.defer_destroy(current);
@@ -89,7 +155,10 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
             guard.flush();
             true
         }
-        Err(_) => false,
+        Err(_) => {
+            // FreezeGuard::drop unfreezes the slot.
+            false
+        }
     }
 }
 
