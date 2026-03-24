@@ -140,6 +140,11 @@ impl<K: Key, V: Clone + Send + Sync> MapRef<'_, K, V> {
         self.map.rebuild(&self.guard);
     }
 
+    /// Remove all entries from the map and return them as a sorted `Vec`.
+    pub fn drain(&self) -> Vec<(K, V)> {
+        self.map.drain(&self.guard)
+    }
+
     /// Remove all entries from the map.
     pub fn clear(&self) {
         self.map.clear(&self.guard);
@@ -537,6 +542,73 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
                 &guard.inner,
             );
         }
+    }
+
+    /// Remove all entries from the map and return them as a sorted `Vec`.
+    ///
+    /// Uses the same freeze protocol as [`rebuild`](Self::rebuild) to coordinate
+    /// with concurrent inserts. After draining, the map has a fresh root identical
+    /// to one created by [`new`](Self::new).
+    ///
+    /// Returns an empty `Vec` if the map is already empty or if the freeze CAS
+    /// fails (another thread is rebuilding concurrently).
+    pub fn drain(&self, guard: &Guard) -> Vec<(K, V)> {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        if root_shared.is_null() || root_shared.tag() != 0 {
+            return Vec::new();
+        }
+
+        // Freeze the root so concurrent inserts spin-wait.
+        let frozen = root_shared.with_tag(1);
+        if self
+            .root
+            .compare_exchange(
+                root_shared,
+                frozen,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                &guard.inner,
+            )
+            .is_err()
+        {
+            return Vec::new();
+        }
+
+        // SAFETY: root is not null (checked above) and frozen by us.
+        let root = unsafe { root_shared.deref() };
+        let pairs = iter::sorted_pairs(root, &guard.inner);
+
+        let new_root = Node::with_capacity(LinearModel::new(1.0, 0.0), 64);
+        let new_owned = Owned::new(new_root);
+        if self
+            .root
+            .compare_exchange(
+                frozen,
+                new_owned,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                &guard.inner,
+            )
+            .is_ok()
+        {
+            // SAFETY: CAS succeeded; old root is unreachable to new readers.
+            unsafe {
+                guard.inner.defer_destroy(root_shared);
+            }
+            self.len.store(0, Ordering::Relaxed);
+            self.next_root_rebuild
+                .store(INITIAL_ROOT_REBUILD_THRESHOLD, Ordering::Relaxed);
+        } else {
+            let _ = self.root.compare_exchange(
+                frozen,
+                root_shared,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+                &guard.inner,
+            );
+        }
+
+        pairs
     }
 
     /// Remove all entries from the map, resetting it to an empty state.
@@ -979,5 +1051,69 @@ mod tests {
         m.clear();
         assert!(m.is_empty());
         assert_eq!(m.get(&1), None);
+    }
+
+    #[test]
+    fn drain_returns_sorted_entries() {
+        let map = LearnedMap::new();
+        let g = map.guard();
+        for i in (0..50u64).rev() {
+            map.insert(i, i * 10, &g);
+        }
+        assert_eq!(map.len(), 50);
+        let drained = map.drain(&g);
+        assert_eq!(drained.len(), 50);
+        // Verify sorted order
+        for w in drained.windows(2) {
+            assert!(w[0].0 < w[1].0);
+        }
+        // Verify contents
+        for (i, (k, v)) in drained.iter().enumerate() {
+            assert_eq!(*k, i as u64);
+            assert_eq!(*v, (i as u64) * 10);
+        }
+        // Map should be empty after drain
+        let g2 = map.guard();
+        assert!(map.is_empty());
+        assert_eq!(map.get(&0, &g2), None);
+    }
+
+    #[test]
+    fn drain_empty_returns_empty() {
+        let map = LearnedMap::<u64, u64>::new();
+        let g = map.guard();
+        let drained = map.drain(&g);
+        assert!(drained.is_empty());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn drain_then_reinsert() {
+        let map = LearnedMap::new();
+        let g = map.guard();
+        for i in 0..30u64 {
+            map.insert(i, i, &g);
+        }
+        let drained = map.drain(&g);
+        assert_eq!(drained.len(), 30);
+        let g2 = map.guard();
+        for i in 100..110u64 {
+            map.insert(i, i, &g2);
+        }
+        assert_eq!(map.len(), 10);
+        assert_eq!(map.get(&100, &g2), Some(&100));
+        assert_eq!(map.get(&0, &g2), None);
+    }
+
+    #[test]
+    fn map_ref_drain() {
+        let map = LearnedMap::new();
+        let m = map.pin();
+        m.insert(3u64, "c");
+        m.insert(1, "a");
+        m.insert(2, "b");
+        let drained = m.drain();
+        assert_eq!(drained, vec![(1, "a"), (2, "b"), (3, "c")]);
+        assert!(m.is_empty());
     }
 }
