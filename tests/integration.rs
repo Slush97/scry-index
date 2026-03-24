@@ -668,7 +668,10 @@ fn insert_u64_keys_same_f64() {
     let base: u64 = 1_700_000_000_000_000_000;
     let k1 = base;
     let k2 = base + 1;
-    assert_eq!(k1 as f64, k2 as f64, "precondition: keys must share f64");
+    #[allow(clippy::float_cmp)]
+    {
+        assert_eq!(k1 as f64, k2 as f64, "precondition: keys must share f64");
+    }
 
     let map = LearnedMap::new();
     let g = map.guard();
@@ -691,11 +694,7 @@ fn insert_many_u64_keys_same_f64() {
     }
     assert_eq!(map.len(), n as usize);
     for i in 0..n {
-        assert_eq!(
-            map.get(&(base + i), &g),
-            Some(&i),
-            "missing key base+{i}"
-        );
+        assert_eq!(map.get(&(base + i), &g), Some(&i), "missing key base+{i}");
     }
 }
 

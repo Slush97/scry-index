@@ -223,7 +223,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         // historical data, then stream new entries.
         let build_config = Config {
             range_headroom: config.range_headroom.max(1.0),
-            ..config.clone()
+            ..config
         };
         let root = build::bulk_load(pairs, &build_config)?;
         let root_atomic = Atomic::new(root);
@@ -272,17 +272,36 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// When `auto_rebuild` is enabled, the insert path tracks descent depth
     /// and triggers a localized subtree rebuild if the depth exceeds the
     /// configured threshold. No global lock is required.
+    ///
+    /// If a concurrent root rebuild replaces the tree, the insert detects the
+    /// change and retries against the new root. A `was_new` flag tracks
+    /// whether the key was newly inserted across retries so `len` is
+    /// incremented exactly once.
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
-        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
-        // SAFETY: root is always non-null.
-        let root = unsafe { root_shared.deref() };
-        let result = insert::insert(root, key, &value, &self.config, &guard.inner);
-        if result == InsertResult::Inserted {
-            let new_len = self.len.fetch_add(1, Ordering::Relaxed) + 1;
-            self.maybe_rebuild_root(new_len, guard);
-            true
-        } else {
-            false
+        let mut was_new = false;
+        loop {
+            let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+            // If root is frozen (tagged), a global rebuild is in progress.
+            if root_shared.tag() != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            // SAFETY: root is always non-null.
+            let root = unsafe { root_shared.deref() };
+            let result = insert::insert(root, key, &value, &self.config, &guard.inner);
+            // Validate: root wasn't replaced or frozen by a concurrent rebuild.
+            if self.root.load(Ordering::Acquire, &guard.inner) != root_shared {
+                if result == InsertResult::Inserted {
+                    was_new = true;
+                }
+                continue;
+            }
+            let is_new = result == InsertResult::Inserted || was_new;
+            if is_new {
+                let new_len = self.len.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                self.maybe_rebuild_root(new_len, guard);
+            }
+            return is_new;
         }
     }
 
@@ -304,7 +323,12 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         let next_threshold = threshold.saturating_mul(ROOT_REBUILD_GROWTH_FACTOR);
         if self
             .next_root_rebuild
-            .compare_exchange(threshold, next_threshold, Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(
+                threshold,
+                next_threshold,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             self.rebuild(guard);
@@ -411,21 +435,45 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// FMCD model fitting. This compacts the tree and restores O(1) lookups
     /// after many incremental inserts.
     ///
-    /// This is lock-free: it snapshots the current tree, builds a new one,
-    /// and CAS-swaps the root. Concurrent mutations that land in the old tree
-    /// between the snapshot and the CAS may be lost (same as any lock-free
-    /// compaction). Use for manual compaction when write quiescence is
-    /// acceptable, or rely on the automatic localized rebuilds for online use.
+    /// The root is *frozen* (tagged) during the rebuild so concurrent inserts
+    /// spin-wait and then retry against the new root. In-flight inserts that
+    /// loaded the old root before the freeze detect the change via post-insert
+    /// validation in [`LearnedMap::insert`] and retry automatically.
     pub fn rebuild(&self, guard: &Guard) {
         let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
-        if root_shared.is_null() {
+        if root_shared.is_null() || root_shared.tag() != 0 {
             return;
         }
         // SAFETY: root is not null.
         let root = unsafe { root_shared.deref() };
 
+        // Freeze the root: tag it so concurrent inserts spin-wait instead
+        // of operating on the old tree during the rebuild.
+        let frozen = root_shared.with_tag(1);
+        if self
+            .root
+            .compare_exchange(
+                root_shared,
+                frozen,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                &guard.inner,
+            )
+            .is_err()
+        {
+            return;
+        }
+
         let pairs = iter::sorted_pairs(root, &guard.inner);
         if pairs.is_empty() {
+            // Unfreeze.
+            let _ = self.root.compare_exchange(
+                frozen,
+                root_shared,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+                &guard.inner,
+            );
             return;
         }
 
@@ -437,13 +485,21 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             ..self.config.clone()
         };
         let Ok(new_root) = build::bulk_load(&pairs, &rebuild_config) else {
+            // Unfreeze.
+            let _ = self.root.compare_exchange(
+                frozen,
+                root_shared,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+                &guard.inner,
+            );
             return;
         };
         let new_owned = Owned::new(new_root);
         if self
             .root
             .compare_exchange(
-                root_shared,
+                frozen,
                 new_owned,
                 Ordering::AcqRel,
                 Ordering::Acquire,
@@ -452,19 +508,29 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             .is_ok()
         {
             // SAFETY: CAS succeeded; old root is unreachable to new readers.
+            // In-flight inserts detect the change via map::insert validation.
             unsafe {
                 guard.inner.defer_destroy(root_shared);
             }
+            // Don't reset len — it's maintained solely by map::insert
+            // (fetch_add) and map::remove (fetch_sub). Resetting via store
+            // would race with concurrent fetch_adds.
             let count = pairs.len();
-            self.len.store(count, Ordering::Relaxed);
             // Reset the rebuild schedule relative to the new tree's size.
             self.next_root_rebuild.store(
                 count.saturating_mul(ROOT_REBUILD_GROWTH_FACTOR),
                 Ordering::Relaxed,
             );
+        } else {
+            // CAS failed after freeze — shouldn't happen, but unfreeze.
+            let _ = self.root.compare_exchange(
+                frozen,
+                root_shared,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+                &guard.inner,
+            );
         }
-        // On CAS failure: concurrent modification — our rebuilt tree is
-        // discarded (the Owned<Node> in the Err is dropped automatically).
     }
 }
 
@@ -766,10 +832,7 @@ mod tests {
             map.insert(i, i, &g);
         }
         let depth = map.max_depth(&g);
-        assert!(
-            depth > 5,
-            "depth {depth} too low without auto rebuild"
-        );
+        assert!(depth > 5, "depth {depth} too low without auto rebuild");
     }
 
     #[test]

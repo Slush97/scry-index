@@ -3,6 +3,14 @@
 //! Simulates a metrics ingestion service to compare `LearnedMap` against
 //! `RwLock<BTreeMap>` and crossbeam `SkipMap` across realistic workloads.
 //!
+#![allow(
+    clippy::too_many_lines,
+    clippy::from_iter_instead_of_collect,
+    clippy::needless_pass_by_value,
+    dead_code,
+    clippy::uninlined_format_args,
+    clippy::collection_is_never_read
+)]
 //! Run with:
 //! ```sh
 //! cargo run --example simulate --release
@@ -73,7 +81,9 @@ fn speedup(baseline: Duration, candidate: Duration) -> String {
 /// 1M sequential timestamps at microsecond intervals from a fixed epoch.
 fn sequential_timestamps(n: usize) -> Vec<(u64, u64)> {
     let base: u64 = 1_700_000_000_000_000;
-    (0..n as u64).map(|i| (base + i, i.wrapping_mul(7).wrapping_add(42))).collect()
+    (0..n as u64)
+        .map(|i| (base + i, i.wrapping_mul(7).wrapping_add(42)))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +109,13 @@ fn bench_bulk_load(data: &[(u64, u64)]) -> WorkloadResult {
     black_box(&skip);
     let skipmap = start.elapsed();
 
-    WorkloadResult { name: "Bulk load", detail: format!("{n} seq keys"), learned, btree, skipmap }
+    WorkloadResult {
+        name: "Bulk load",
+        detail: format!("{n} seq keys"),
+        learned,
+        btree,
+        skipmap,
+    }
 }
 
 fn bench_seq_lookup(data: &[(u64, u64)]) -> WorkloadResult {
@@ -136,7 +152,9 @@ fn bench_seq_lookup(data: &[(u64, u64)]) -> WorkloadResult {
     WorkloadResult {
         name: "Point lookup (seq)",
         detail: format!("{sample_n} lookups"),
-        learned, btree, skipmap,
+        learned,
+        btree,
+        skipmap,
     }
 }
 
@@ -151,7 +169,9 @@ fn bench_rand_lookup(data: &[(u64, u64)]) -> WorkloadResult {
         sm.insert(k, v);
     }
     let keys: Vec<u64> = data.iter().map(|(k, _)| *k).collect();
-    let sample: Vec<u64> = (0..LOOKUP_SAMPLE).map(|_| keys[rng.gen_range(0..n)]).collect();
+    let sample: Vec<u64> = (0..LOOKUP_SAMPLE)
+        .map(|_| keys[rng.gen_range(0..n)])
+        .collect();
 
     let guard = lm.guard();
     let start = Instant::now();
@@ -175,7 +195,9 @@ fn bench_rand_lookup(data: &[(u64, u64)]) -> WorkloadResult {
     WorkloadResult {
         name: "Point lookup (rand)",
         detail: format!("{LOOKUP_SAMPLE} lookups"),
-        learned, btree, skipmap,
+        learned,
+        btree,
+        skipmap,
     }
 }
 
@@ -214,7 +236,9 @@ fn bench_range_scan(data: &[(u64, u64)]) -> WorkloadResult {
     WorkloadResult {
         name: "Range scan",
         detail: format!("{RANGE_SIZE} keys x{RANGE_ITERS}"),
-        learned, btree, skipmap,
+        learned,
+        btree,
+        skipmap,
     }
 }
 
@@ -250,7 +274,9 @@ fn bench_incremental_insert(data: &[(u64, u64)]) -> WorkloadResult {
     WorkloadResult {
         name: "Incremental insert",
         detail: format!("{insert_n} appends into {}", data.len()),
-        learned, btree, skipmap,
+        learned,
+        btree,
+        skipmap,
     }
 }
 
@@ -267,70 +293,86 @@ fn bench_concurrent_read(data: &[(u64, u64)]) -> WorkloadResult {
     // LearnedMap — lock-free
     let lm = Arc::new(LearnedMap::bulk_load(data).unwrap());
     let bar = Arc::new(Barrier::new(threads + 1));
-    let handles: Vec<_> = (0..threads).map(|_| {
-        let m = Arc::clone(&lm);
-        let k = Arc::clone(&keys);
-        let b = Arc::clone(&bar);
-        std::thread::spawn(move || {
-            let mut rng = rand::thread_rng();
-            b.wait();
-            let g = m.guard();
-            for _ in 0..reads {
-                black_box(m.get(&k[rng.gen_range(0..n)], &g));
-            }
+    let handles: Vec<_> = (0..threads)
+        .map(|_| {
+            let m = Arc::clone(&lm);
+            let k = Arc::clone(&keys);
+            let b = Arc::clone(&bar);
+            std::thread::spawn(move || {
+                let mut rng = rand::thread_rng();
+                b.wait();
+                let g = m.guard();
+                for _ in 0..reads {
+                    black_box(m.get(&k[rng.gen_range(0..n)], &g));
+                }
+            })
         })
-    }).collect();
+        .collect();
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let learned = start.elapsed();
 
     // RwLock<BTreeMap>
     let bt = Arc::new(RwLock::new(BTreeMap::from_iter(data.iter().copied())));
     let bar = Arc::new(Barrier::new(threads + 1));
-    let handles: Vec<_> = (0..threads).map(|_| {
-        let m = Arc::clone(&bt);
-        let k = Arc::clone(&keys);
-        let b = Arc::clone(&bar);
-        std::thread::spawn(move || {
-            let mut rng = rand::thread_rng();
-            b.wait();
-            for _ in 0..reads {
-                let g = m.read().unwrap();
-                black_box(g.get(&k[rng.gen_range(0..n)]));
-            }
+    let handles: Vec<_> = (0..threads)
+        .map(|_| {
+            let m = Arc::clone(&bt);
+            let k = Arc::clone(&keys);
+            let b = Arc::clone(&bar);
+            std::thread::spawn(move || {
+                let mut rng = rand::thread_rng();
+                b.wait();
+                for _ in 0..reads {
+                    let g = m.read().unwrap();
+                    black_box(g.get(&k[rng.gen_range(0..n)]));
+                }
+            })
         })
-    }).collect();
+        .collect();
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let btree = start.elapsed();
 
     // SkipMap — lock-free
     let sm = Arc::new(SkipMap::new());
-    for &(k, v) in data { sm.insert(k, v); }
+    for &(k, v) in data {
+        sm.insert(k, v);
+    }
     let bar = Arc::new(Barrier::new(threads + 1));
-    let handles: Vec<_> = (0..threads).map(|_| {
-        let m = Arc::clone(&sm);
-        let k = Arc::clone(&keys);
-        let b = Arc::clone(&bar);
-        std::thread::spawn(move || {
-            let mut rng = rand::thread_rng();
-            b.wait();
-            for _ in 0..reads {
-                black_box(m.get(&k[rng.gen_range(0..n)]));
-            }
+    let handles: Vec<_> = (0..threads)
+        .map(|_| {
+            let m = Arc::clone(&sm);
+            let k = Arc::clone(&keys);
+            let b = Arc::clone(&bar);
+            std::thread::spawn(move || {
+                let mut rng = rand::thread_rng();
+                b.wait();
+                for _ in 0..reads {
+                    black_box(m.get(&k[rng.gen_range(0..n)]));
+                }
+            })
         })
-    }).collect();
+        .collect();
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let skipmap = start.elapsed();
 
     WorkloadResult {
         name: "Concurrent read",
         detail: format!("{threads}T x {reads} lookups"),
-        learned, btree, skipmap,
+        learned,
+        btree,
+        skipmap,
     }
 }
 
@@ -342,66 +384,82 @@ fn bench_concurrent_write(data: &[(u64, u64)]) -> WorkloadResult {
     // LearnedMap
     let lm = Arc::new(LearnedMap::bulk_load(data).unwrap());
     let bar = Arc::new(Barrier::new(threads + 1));
-    let handles: Vec<_> = (0..threads).map(|t| {
-        let m = Arc::clone(&lm);
-        let b = Arc::clone(&bar);
-        std::thread::spawn(move || {
-            let off = t as u64 * writes as u64;
-            b.wait();
-            let g = m.guard();
-            for i in 0..writes as u64 {
-                m.insert(base + off + i, i, &g);
-            }
+    let handles: Vec<_> = (0..threads)
+        .map(|t| {
+            let m = Arc::clone(&lm);
+            let b = Arc::clone(&bar);
+            std::thread::spawn(move || {
+                let off = t as u64 * writes as u64;
+                b.wait();
+                let g = m.guard();
+                for i in 0..writes as u64 {
+                    m.insert(base + off + i, i, &g);
+                }
+            })
         })
-    }).collect();
+        .collect();
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let learned = start.elapsed();
 
     // RwLock<BTreeMap>
     let bt = Arc::new(RwLock::new(BTreeMap::from_iter(data.iter().copied())));
     let bar = Arc::new(Barrier::new(threads + 1));
-    let handles: Vec<_> = (0..threads).map(|t| {
-        let m = Arc::clone(&bt);
-        let b = Arc::clone(&bar);
-        std::thread::spawn(move || {
-            let off = t as u64 * writes as u64;
-            b.wait();
-            for i in 0..writes as u64 {
-                m.write().unwrap().insert(base + off + i, i);
-            }
+    let handles: Vec<_> = (0..threads)
+        .map(|t| {
+            let m = Arc::clone(&bt);
+            let b = Arc::clone(&bar);
+            std::thread::spawn(move || {
+                let off = t as u64 * writes as u64;
+                b.wait();
+                for i in 0..writes as u64 {
+                    m.write().unwrap().insert(base + off + i, i);
+                }
+            })
         })
-    }).collect();
+        .collect();
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let btree = start.elapsed();
 
     // SkipMap
     let sm = Arc::new(SkipMap::new());
-    for &(k, v) in data { sm.insert(k, v); }
+    for &(k, v) in data {
+        sm.insert(k, v);
+    }
     let bar = Arc::new(Barrier::new(threads + 1));
-    let handles: Vec<_> = (0..threads).map(|t| {
-        let m = Arc::clone(&sm);
-        let b = Arc::clone(&bar);
-        std::thread::spawn(move || {
-            let off = t as u64 * writes as u64;
-            b.wait();
-            for i in 0..writes as u64 {
-                m.insert(base + off + i, i);
-            }
+    let handles: Vec<_> = (0..threads)
+        .map(|t| {
+            let m = Arc::clone(&sm);
+            let b = Arc::clone(&bar);
+            std::thread::spawn(move || {
+                let off = t as u64 * writes as u64;
+                b.wait();
+                for i in 0..writes as u64 {
+                    m.insert(base + off + i, i);
+                }
+            })
         })
-    }).collect();
+        .collect();
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let skipmap = start.elapsed();
 
     WorkloadResult {
         name: "Concurrent write",
         detail: format!("{threads}T x {writes} inserts"),
-        learned, btree, skipmap,
+        learned,
+        btree,
+        skipmap,
     }
 }
 
@@ -420,26 +478,35 @@ fn bench_mixed_rw(data: &[(u64, u64)]) -> WorkloadResult {
     let bar = Arc::new(Barrier::new(total + 1));
     let mut handles = Vec::with_capacity(total);
     for _ in 0..readers {
-        let m = Arc::clone(&lm); let k = Arc::clone(&keys); let b = Arc::clone(&bar);
+        let m = Arc::clone(&lm);
+        let k = Arc::clone(&keys);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             let mut rng = rand::thread_rng();
             b.wait();
             let g = m.guard();
-            for _ in 0..reads { black_box(m.get(&k[rng.gen_range(0..n)], &g)); }
+            for _ in 0..reads {
+                black_box(m.get(&k[rng.gen_range(0..n)], &g));
+            }
         }));
     }
     for t in 0..writers {
-        let m = Arc::clone(&lm); let b = Arc::clone(&bar);
+        let m = Arc::clone(&lm);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             let off = t as u64 * writes as u64;
             b.wait();
             let g = m.guard();
-            for i in 0..writes as u64 { m.insert(base + off + i, i, &g); }
+            for i in 0..writes as u64 {
+                m.insert(base + off + i, i, &g);
+            }
         }));
     }
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let learned = start.elapsed();
 
     // RwLock<BTreeMap>
@@ -447,7 +514,9 @@ fn bench_mixed_rw(data: &[(u64, u64)]) -> WorkloadResult {
     let bar = Arc::new(Barrier::new(total + 1));
     let mut handles = Vec::with_capacity(total);
     for _ in 0..readers {
-        let m = Arc::clone(&bt); let k = Arc::clone(&keys); let b = Arc::clone(&bar);
+        let m = Arc::clone(&bt);
+        let k = Arc::clone(&keys);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             let mut rng = rand::thread_rng();
             b.wait();
@@ -458,48 +527,66 @@ fn bench_mixed_rw(data: &[(u64, u64)]) -> WorkloadResult {
         }));
     }
     for t in 0..writers {
-        let m = Arc::clone(&bt); let b = Arc::clone(&bar);
+        let m = Arc::clone(&bt);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             let off = t as u64 * writes as u64;
             b.wait();
-            for i in 0..writes as u64 { m.write().unwrap().insert(base + off + i, i); }
+            for i in 0..writes as u64 {
+                m.write().unwrap().insert(base + off + i, i);
+            }
         }));
     }
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let btree = start.elapsed();
 
     // SkipMap
     let sm = Arc::new(SkipMap::new());
-    for &(k, v) in data { sm.insert(k, v); }
+    for &(k, v) in data {
+        sm.insert(k, v);
+    }
     let bar = Arc::new(Barrier::new(total + 1));
     let mut handles = Vec::with_capacity(total);
     for _ in 0..readers {
-        let m = Arc::clone(&sm); let k = Arc::clone(&keys); let b = Arc::clone(&bar);
+        let m = Arc::clone(&sm);
+        let k = Arc::clone(&keys);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             let mut rng = rand::thread_rng();
             b.wait();
-            for _ in 0..reads { black_box(m.get(&k[rng.gen_range(0..n)])); }
+            for _ in 0..reads {
+                black_box(m.get(&k[rng.gen_range(0..n)]));
+            }
         }));
     }
     for t in 0..writers {
-        let m = Arc::clone(&sm); let b = Arc::clone(&bar);
+        let m = Arc::clone(&sm);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             let off = t as u64 * writes as u64;
             b.wait();
-            for i in 0..writes as u64 { m.insert(base + off + i, i); }
+            for i in 0..writes as u64 {
+                m.insert(base + off + i, i);
+            }
         }));
     }
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let skipmap = start.elapsed();
 
     WorkloadResult {
         name: "Mixed read/write",
         detail: format!("{readers}R + {writers}W"),
-        learned, btree, skipmap,
+        learned,
+        btree,
+        skipmap,
     }
 }
 
@@ -519,25 +606,33 @@ fn bench_concurrent_range(data: &[(u64, u64)]) -> WorkloadResult {
     let bar = Arc::new(Barrier::new(total + 1));
     let mut handles = Vec::with_capacity(total);
     for _ in 0..readers {
-        let m = Arc::clone(&lm); let b = Arc::clone(&bar);
+        let m = Arc::clone(&lm);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             b.wait();
             let g = m.guard();
-            for _ in 0..scans { black_box(m.range(mid..range_end, &g).count()); }
+            for _ in 0..scans {
+                black_box(m.range(mid..range_end, &g).count());
+            }
         }));
     }
     for t in 0..writers {
-        let m = Arc::clone(&lm); let b = Arc::clone(&bar);
+        let m = Arc::clone(&lm);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             let off = t as u64 * writes as u64;
             b.wait();
             let g = m.guard();
-            for i in 0..writes as u64 { m.insert(base + off + i, i, &g); }
+            for i in 0..writes as u64 {
+                m.insert(base + off + i, i, &g);
+            }
         }));
     }
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let learned = start.elapsed();
 
     // RwLock<BTreeMap>
@@ -545,7 +640,8 @@ fn bench_concurrent_range(data: &[(u64, u64)]) -> WorkloadResult {
     let bar = Arc::new(Barrier::new(total + 1));
     let mut handles = Vec::with_capacity(total);
     for _ in 0..readers {
-        let m = Arc::clone(&bt); let b = Arc::clone(&bar);
+        let m = Arc::clone(&bt);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             b.wait();
             for _ in 0..scans {
@@ -555,47 +651,64 @@ fn bench_concurrent_range(data: &[(u64, u64)]) -> WorkloadResult {
         }));
     }
     for t in 0..writers {
-        let m = Arc::clone(&bt); let b = Arc::clone(&bar);
+        let m = Arc::clone(&bt);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             let off = t as u64 * writes as u64;
             b.wait();
-            for i in 0..writes as u64 { m.write().unwrap().insert(base + off + i, i); }
+            for i in 0..writes as u64 {
+                m.write().unwrap().insert(base + off + i, i);
+            }
         }));
     }
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let btree = start.elapsed();
 
     // SkipMap
     let sm = Arc::new(SkipMap::new());
-    for &(k, v) in data { sm.insert(k, v); }
+    for &(k, v) in data {
+        sm.insert(k, v);
+    }
     let bar = Arc::new(Barrier::new(total + 1));
     let mut handles = Vec::with_capacity(total);
     for _ in 0..readers {
-        let m = Arc::clone(&sm); let b = Arc::clone(&bar);
+        let m = Arc::clone(&sm);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             b.wait();
-            for _ in 0..scans { black_box(m.range(mid..range_end).count()); }
+            for _ in 0..scans {
+                black_box(m.range(mid..range_end).count());
+            }
         }));
     }
     for t in 0..writers {
-        let m = Arc::clone(&sm); let b = Arc::clone(&bar);
+        let m = Arc::clone(&sm);
+        let b = Arc::clone(&bar);
         handles.push(std::thread::spawn(move || {
             let off = t as u64 * writes as u64;
             b.wait();
-            for i in 0..writes as u64 { m.insert(base + off + i, i); }
+            for i in 0..writes as u64 {
+                m.insert(base + off + i, i);
+            }
         }));
     }
     bar.wait();
     let start = Instant::now();
-    for h in handles { h.join().unwrap(); }
+    for h in handles {
+        h.join().unwrap();
+    }
     let skipmap = start.elapsed();
 
     WorkloadResult {
         name: "Range scan + writes",
         detail: format!("{readers}R(scan) + {writers}W"),
-        learned, btree, skipmap,
+        learned,
+        btree,
+        skipmap,
     }
 }
 
@@ -675,8 +788,11 @@ fn main() {
     for r in &results {
         println!(
             "  {:<nw$} {:<dw$} {:>tw$} {:>tw$} {:>tw$}",
-            r.name, r.detail,
-            fmt_dur(r.learned), fmt_dur(r.btree), fmt_dur(r.skipmap),
+            r.name,
+            r.detail,
+            fmt_dur(r.learned),
+            fmt_dur(r.btree),
+            fmt_dur(r.skipmap),
         );
     }
 
