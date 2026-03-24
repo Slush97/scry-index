@@ -70,14 +70,14 @@ src/
     `[u8; N]`, fixed-size byte arrays, and eventually `AsRef<[u8]>` key types.
     This is the single biggest blocker for real-world adoption (no strings, UUIDs,
     or compound keys today). Add `entry` API / `get_or_insert` for atomic
-    check-and-insert. Add `clear()` / `drain()`. `bulk_load` variant that
-    deduplicates instead of rejecting duplicates. Make `len()` exact under
-    concurrency or clearly document the approximation on `MapRef::len()`.
+    check-and-insert. `clear()` (done) / `drain()` (done). `bulk_load_dedup`
+    variant that deduplicates instead of rejecting duplicates (done). `len()`
+    approximation documented on all four callsites (done).
   - **5c — Durability & operational readiness**: Rebuild-under-concurrency must
     not silently drop writes — add a retry-on-CAS-failure mode or document the
     write-quiescence requirement. Tombstone compaction for remove-heavy workloads
     (remove currently nulls slots permanently with no reclamation until explicit
-    rebuild). Memory estimation API (`allocated_bytes()`). Optional `serde`
+    rebuild). Memory estimation API `allocated_bytes()` (done). Optional `serde`
     serialization behind a feature flag. Documentation, benchmarks tuning,
     crates.io publish.
   - **Phase 4.5 (done)**: Fixed stack overflow for keys with identical f64
