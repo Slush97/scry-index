@@ -69,8 +69,10 @@ src/
   - **5b — Key generalization & API gaps**: Relax `Key: Copy` to `Key: Clone`
     and support `[u8; N]` fixed-size byte arrays (done — enables UUIDs, hashes,
     and other fixed-width binary keys). `AsRef<[u8]>` for heap-allocated keys
-    like `String` is remaining — requires storing keys behind `Arc` or similar
-    in `SlotInner` to avoid lifetime issues with epoch-based reclamation.
+    like `String` and `Vec<u8>` (done — `String` and `Vec<u8>` implement `Key`
+    using prefix-based model input (first 8 bytes) and ordinal (first 16 bytes),
+    with `Ord`-based `split_key` fallback in `Node` for keys sharing a 16-byte
+    prefix; no `Arc` needed — epoch reclamation suffices).
     Add `entry` API / `get_or_insert` for atomic
     check-and-insert (done — `get_or_insert` and `get_or_insert_with` on
     `LearnedMap` and `MapRef`; atomic CAS-based, no TOCTOU race).
@@ -83,7 +85,10 @@ src/
     (done — per-node `num_tombstones` counter, configurable
     `tombstone_ratio_threshold` (default 0.5), piggybacks on localized subtree
     rebuild). Memory estimation API `allocated_bytes()` (done). Optional `serde`
-    serialization behind a feature flag. Documentation, benchmarks tuning,
+    serialization behind a feature flag (done — `LearnedMap` and `LearnedSet`
+    serialize as sorted element sequences and deserialize via `bulk_load_dedup`;
+    `Config` and `Error` use derived impls; all behind `#[cfg(feature = "serde")]`).
+    Documentation, benchmarks tuning,
     crates.io publish.
   - **Phase 4.5 (done)**: Fixed stack overflow for keys with identical f64
     representations (u64 above 2^53, nanosecond timestamps). Added

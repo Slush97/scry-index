@@ -831,6 +831,40 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     }
 }
 
+#[cfg(feature = "serde")]
+impl<K, V> serde::Serialize for LearnedMap<K, V>
+where
+    K: Key + serde::Serialize,
+    V: Clone + Send + Sync + serde::Serialize,
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+
+        let guard = self.guard();
+        let len = self.len();
+        let mut seq = serializer.serialize_seq(Some(len))?;
+        for (k, v) in self.iter(&guard) {
+            seq.serialize_element(&(k, v))?;
+        }
+        seq.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, K, V> serde::Deserialize<'de> for LearnedMap<K, V>
+where
+    K: Key + serde::Deserialize<'de>,
+    V: Clone + Send + Sync + serde::Deserialize<'de>,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let pairs: Vec<(K, V)> = Vec::deserialize(deserializer)?;
+        if pairs.is_empty() {
+            return Ok(Self::new());
+        }
+        Self::bulk_load_dedup(&pairs).map_err(serde::de::Error::custom)
+    }
+}
+
 impl<K: Key, V: Clone + Send + Sync> Default for LearnedMap<K, V> {
     fn default() -> Self {
         Self::new()

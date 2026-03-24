@@ -2,6 +2,7 @@
 
 /// Configuration parameters for [`LearnedMap`](crate::LearnedMap).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Config {
     /// Expansion factor for node arrays.
     ///
