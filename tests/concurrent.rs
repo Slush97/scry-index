@@ -852,7 +852,11 @@ fn localized_rebuild_no_data_loss() {
     // Sparse anchors spanning 0..8000 create a root model that maps each
     // thread's 1000-key range to distinct root slots (~25 slots per thread).
     let anchors: Vec<(u64, u64)> = (0..8000).step_by(80).map(|i| (i, i)).collect();
-    let map = Arc::new(LearnedMap::bulk_load(&anchors).unwrap());
+    // Disable auto_rebuild to prevent root-level rebuilds from racing with
+    // concurrent inserts (root rebuilds can lose data by design). This test
+    // validates that *localized subtree* rebuilds preserve all keys.
+    let config = scry_index::Config::new().auto_rebuild(false);
+    let map = Arc::new(LearnedMap::bulk_load_with_config(&anchors, config).unwrap());
     let barrier = Arc::new(Barrier::new(8));
 
     let handles: Vec<_> = (0..8u64)

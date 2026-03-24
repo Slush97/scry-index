@@ -134,8 +134,37 @@ cargo clippy                      # lint check
 cargo bench                       # benchmarks
 ```
 
+## Development Workflow
+
+### Before Every Commit
+
+1. `cargo test` — all tests must pass. No committing with known failures.
+2. `cargo clippy` — zero warnings. Fix issues, don't suppress without reason.
+3. Review the diff (`git diff --staged`) before committing.
+
+### Before Every Push
+
+1. Run the full validation sequence:
+   ```bash
+   cargo clippy && cargo test
+   ```
+2. If CI exists, verify it passes before merging or pushing to `main`.
+3. Never force-push to `main`.
+
+### Commit Practices
+
+- Each commit should be a single logical change (one bug fix, one feature, one refactor).
+- Write commit messages that explain *why*, not just *what*.
+- Every bug fix commit must include a regression test.
+- Don't commit half-working code to `main` — use a feature branch if work is in progress.
+
+### Branch Strategy
+
+- `main` is always green. All tests pass on every commit.
+- Feature branches for multi-commit work. Rebase onto `main` before merging.
+- Delete feature branches after merge.
+
 ## Repository
 
 - Owner: slush97
 - Private repo: github.com/slush97/scry-index
-- Branch strategy: `main` is always green. Feature branches for phases.
