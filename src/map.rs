@@ -247,6 +247,59 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         })
     }
 
+    /// Create a learned map from sorted key-value pairs, deduplicating keys.
+    ///
+    /// When duplicate keys are present, the **last** value for each key is kept,
+    /// matching the semantics of `BTreeMap::from_iter`. The input must be sorted
+    /// by key in ascending order but may contain duplicates.
+    ///
+    /// This is equivalent to deduplicating and then calling [`bulk_load`](Self::bulk_load).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `pairs` is empty (after dedup) or not sorted by key.
+    pub fn bulk_load_dedup(pairs: &[(K, V)]) -> Result<Self> {
+        Self::bulk_load_dedup_with_config(pairs, Config::default())
+    }
+
+    /// Create a learned map from sorted key-value pairs with dedup and config.
+    ///
+    /// See [`bulk_load_dedup`](Self::bulk_load_dedup) for semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `pairs` is empty (after dedup) or not sorted by key.
+    pub fn bulk_load_dedup_with_config(pairs: &[(K, V)], config: Config) -> Result<Self> {
+        if pairs.is_empty() {
+            return Err(crate::error::Error::EmptyData);
+        }
+
+        // Verify sorted (non-strictly: duplicates allowed).
+        for window in pairs.windows(2) {
+            if window[0].0 > window[1].0 {
+                return Err(crate::error::Error::NotSorted);
+            }
+        }
+
+        // Dedup: keep last value per key (scan right-to-left, take first unseen).
+        let mut deduped = Vec::with_capacity(pairs.len());
+        for window in pairs.windows(2) {
+            if window[0].0 != window[1].0 {
+                deduped.push(window[0].clone());
+            }
+        }
+        // Always include the last element.
+        if let Some(last) = pairs.last() {
+            deduped.push(last.clone());
+        }
+
+        if deduped.is_empty() {
+            return Err(crate::error::Error::EmptyData);
+        }
+
+        Self::bulk_load_with_config(&deduped, config)
+    }
+
     /// Acquire an epoch guard for use with operations on this map.
     ///
     /// The guard pins the current thread to an epoch, preventing any
@@ -795,6 +848,50 @@ mod tests {
         assert_eq!(map.len(), 5);
         assert_eq!(map.get(&15, &g), Some(&15));
         assert_eq!(map.get(&25, &g), Some(&25));
+    }
+
+    #[test]
+    fn bulk_load_dedup_keeps_last() {
+        let pairs: Vec<(u64, &str)> = vec![(1, "a"), (1, "A"), (2, "b"), (3, "c"), (3, "C")];
+        let map = LearnedMap::bulk_load_dedup(&pairs).unwrap();
+        let g = map.guard();
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&1, &g), Some(&"A"));
+        assert_eq!(map.get(&2, &g), Some(&"b"));
+        assert_eq!(map.get(&3, &g), Some(&"C"));
+    }
+
+    #[test]
+    fn bulk_load_dedup_no_duplicates() {
+        let pairs: Vec<(u64, u64)> = (0..50).map(|i| (i, i * 10)).collect();
+        let map = LearnedMap::bulk_load_dedup(&pairs).unwrap();
+        let g = map.guard();
+        assert_eq!(map.len(), 50);
+        for (k, v) in &pairs {
+            assert_eq!(map.get(k, &g), Some(v));
+        }
+    }
+
+    #[test]
+    fn bulk_load_dedup_all_same_key() {
+        let pairs: Vec<(u64, u64)> = (0..10).map(|i| (42, i)).collect();
+        let map = LearnedMap::bulk_load_dedup(&pairs).unwrap();
+        let g = map.guard();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(&42, &g), Some(&9));
+    }
+
+    #[test]
+    fn bulk_load_dedup_empty() {
+        let result = LearnedMap::<u64, u64>::bulk_load_dedup(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn bulk_load_dedup_not_sorted() {
+        let pairs: Vec<(u64, u64)> = vec![(3, 0), (1, 0), (2, 0)];
+        let result = LearnedMap::bulk_load_dedup(&pairs);
+        assert!(result.is_err());
     }
 
     #[test]
