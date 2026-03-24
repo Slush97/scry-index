@@ -78,7 +78,8 @@ src/
   - **5c — Durability & operational readiness**: Rebuild-under-concurrency must
     not silently drop writes — add a retry-on-CAS-failure mode or document the
     write-quiescence requirement. Tombstone compaction for remove-heavy workloads
-    (remove currently nulls slots permanently with no reclamation until explicit
+    (done — per-node `num_tombstones` counter, configurable
+    `tombstone_ratio_threshold` (default 0.5), piggybacks on localized subtree
     rebuild). Memory estimation API `allocated_bytes()` (done). Optional `serde`
     serialization behind a feature flag. Documentation, benchmarks tuning,
     crates.io publish.

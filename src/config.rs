@@ -32,6 +32,17 @@ pub struct Config {
     /// Default: `8`.
     pub rebuild_depth_threshold: usize,
 
+    /// Maximum tombstone ratio before a localized rebuild is triggered.
+    ///
+    /// When a node's tombstone count (slots nulled by remove) exceeds this
+    /// fraction of its capacity, the removing thread rebuilds the parent
+    /// subtree inline. Only applies when `auto_rebuild` is `true`.
+    ///
+    /// Set to `1.0` to disable tombstone compaction.
+    ///
+    /// Default: `0.5` (compact when >50% of slots are tombstones).
+    pub tombstone_ratio_threshold: f64,
+
     /// Extra key range headroom for model fitting.
     ///
     /// When greater than 0, the model covers `(1 + range_headroom)` times the
@@ -74,6 +85,20 @@ impl Config {
         self
     }
 
+    /// Set the tombstone ratio threshold for compaction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `threshold` is not in `(0.0, 1.0]`.
+    pub fn tombstone_ratio_threshold(mut self, threshold: f64) -> Self {
+        assert!(
+            threshold > 0.0 && threshold <= 1.0,
+            "tombstone_ratio_threshold must be in (0.0, 1.0], got {threshold}"
+        );
+        self.tombstone_ratio_threshold = threshold;
+        self
+    }
+
     /// Set the key range headroom for model fitting.
     ///
     /// # Panics
@@ -92,6 +117,7 @@ impl Default for Config {
             expansion_factor: 2.0,
             auto_rebuild: true,
             rebuild_depth_threshold: 8,
+            tombstone_ratio_threshold: 0.5,
             range_headroom: 0.0,
         }
     }
@@ -117,5 +143,29 @@ mod tests {
     #[should_panic(expected = "expansion_factor must be >= 1.0")]
     fn reject_low_expansion() {
         Config::new().expansion_factor(0.5);
+    }
+
+    #[test]
+    fn tombstone_threshold_builder() {
+        let config = Config::new().tombstone_ratio_threshold(0.75);
+        assert!((config.tombstone_ratio_threshold - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tombstone_threshold_default() {
+        let config = Config::default();
+        assert!((config.tombstone_ratio_threshold - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[should_panic(expected = "tombstone_ratio_threshold must be in (0.0, 1.0]")]
+    fn reject_zero_tombstone_threshold() {
+        Config::new().tombstone_ratio_threshold(0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "tombstone_ratio_threshold must be in (0.0, 1.0]")]
+    fn reject_high_tombstone_threshold() {
+        Config::new().tombstone_ratio_threshold(1.5);
     }
 }

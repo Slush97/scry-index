@@ -417,7 +417,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
         // SAFETY: root is always non-null.
         let root = unsafe { root_shared.deref() };
-        let removed = remove::remove(root, key, &guard.inner);
+        let removed = remove::remove(root, key, &self.config, &guard.inner);
         if removed {
             self.len.fetch_sub(1, Ordering::Relaxed);
         }

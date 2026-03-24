@@ -932,3 +932,50 @@ fn auto_root_rebuild_concurrent_insert() {
         );
     }
 }
+
+/// Concurrent removes trigger tombstone compaction without corruption.
+#[test]
+fn concurrent_remove_tombstone_compaction() {
+    // Pre-populate
+    let pairs: Vec<(u64, u64)> = (0..4000).map(|i| (i, i)).collect();
+    let map = Arc::new(LearnedMap::bulk_load(&pairs).unwrap());
+    let barrier = Arc::new(Barrier::new(4));
+
+    // 4 threads each remove a disjoint 25% of the keys
+    let handles: Vec<_> = (0..4u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                for i in 0..4000u64 {
+                    if i % 4 == t {
+                        map.remove(&i, &guard);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // All keys should have been removed
+    let guard = map.guard();
+    assert_eq!(map.len(), 0);
+
+    // Map should be structurally intact — re-insert and verify
+    for i in 0..1000u64 {
+        map.insert(i, i, &guard);
+    }
+    let g2 = map.guard();
+    assert_eq!(map.len(), 1000);
+    for i in 0..1000u64 {
+        assert!(
+            map.get(&i, &g2).is_some(),
+            "key {i} missing after tombstone compaction recovery"
+        );
+    }
+}

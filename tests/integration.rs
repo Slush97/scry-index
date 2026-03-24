@@ -996,3 +996,81 @@ fn byte_array_set_works() {
     let missing = 999u64.to_be_bytes();
     assert!(!set.contains(&missing, &g));
 }
+
+// ---------------------------------------------------------------------------
+// Tombstone compaction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tombstone_compaction_preserves_remaining() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in 0..500u64 {
+        map.insert(i, i * 10, &g);
+    }
+    // Remove 80% of keys — should trigger tombstone compaction
+    for i in 0..400u64 {
+        map.remove(&i, &g);
+    }
+    assert_eq!(map.len(), 100);
+    let g2 = map.guard();
+    for i in 400..500u64 {
+        assert_eq!(
+            map.get(&i, &g2),
+            Some(&(i * 10)),
+            "key {i} lost after tombstone compaction"
+        );
+    }
+}
+
+#[test]
+fn tombstone_compaction_disabled() {
+    // Disable compaction by setting threshold to 1.0
+    let config = Config::new().tombstone_ratio_threshold(1.0);
+    let map = LearnedMap::with_config(config);
+    let g = map.guard();
+    for i in 0..200u64 {
+        map.insert(i, i, &g);
+    }
+    let depth_before = map.max_depth(&g);
+    // Remove 90% — no compaction should fire
+    for i in 0..180u64 {
+        map.remove(&i, &g);
+    }
+    let g2 = map.guard();
+    // Depth should not decrease (no compaction ran)
+    let depth_after = map.max_depth(&g2);
+    assert!(
+        depth_after >= depth_before.saturating_sub(1),
+        "depth decreased from {depth_before} to {depth_after} with compaction disabled"
+    );
+    // Remaining keys still present
+    for i in 180..200u64 {
+        assert_eq!(map.get(&i, &g2), Some(&i));
+    }
+}
+
+#[test]
+fn tombstone_compaction_then_reinsert() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in 0..300u64 {
+        map.insert(i, i, &g);
+    }
+    // Remove most keys
+    for i in 0..250u64 {
+        map.remove(&i, &g);
+    }
+    // Reinsert into the compacted tree
+    let g2 = map.guard();
+    for i in 0..250u64 {
+        map.insert(i, i + 1000, &g2);
+    }
+    assert_eq!(map.len(), 300);
+    for i in 0..250u64 {
+        assert_eq!(map.get(&i, &g2), Some(&(i + 1000)));
+    }
+    for i in 250..300u64 {
+        assert_eq!(map.get(&i, &g2), Some(&i));
+    }
+}

@@ -32,6 +32,12 @@ pub struct Node<K, V> {
     slots: Box<[Atomic<SlotInner<K, V>>]>,
     /// Approximate number of data entries in this node (not counting children).
     num_keys: AtomicUsize,
+    /// Approximate number of tombstones (slots nulled by remove) in this node.
+    ///
+    /// Incremented on remove, never decremented. Resets to 0 when the subtree
+    /// is rebuilt (fresh node construction). Used to trigger compaction when the
+    /// ratio exceeds the configured threshold.
+    num_tombstones: AtomicUsize,
 }
 
 impl<K, V> std::fmt::Debug for Node<K, V> {
@@ -40,6 +46,7 @@ impl<K, V> std::fmt::Debug for Node<K, V> {
             .field("model", &self.model)
             .field("capacity", &self.slots.len())
             .field("num_keys", &self.num_keys.load(Ordering::Relaxed))
+            .field("num_tombstones", &self.num_tombstones.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -54,6 +61,7 @@ impl<K: Key, V> Node<K, V> {
             model,
             slots: slots.into_boxed_slice(),
             num_keys: AtomicUsize::new(0),
+            num_tombstones: AtomicUsize::new(0),
         }
     }
 
@@ -101,6 +109,24 @@ impl<K: Key, V> Node<K, V> {
     /// Decrement the approximate key count.
     pub fn dec_keys(&self) {
         self.num_keys.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Increment the approximate tombstone count.
+    pub fn inc_tombstones(&self) {
+        self.num_tombstones.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Return the approximate ratio of tombstones to total capacity.
+    ///
+    /// A value of 0.0 means no tombstones; 1.0 means every slot has been
+    /// nulled by a remove. The count is approximate (never decremented)
+    /// and may slightly overestimate the true ratio.
+    pub fn tombstone_ratio(&self) -> f64 {
+        let cap = self.slots.len();
+        if cap == 0 {
+            return 0.0;
+        }
+        self.num_tombstones.load(Ordering::Relaxed) as f64 / cap as f64
     }
 
     /// Count total keys stored in this node and all descendants.
