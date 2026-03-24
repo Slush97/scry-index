@@ -66,10 +66,12 @@ src/
     audit — current heap alloc per slot via `Atomic<SlotInner>` causes poor
     cache locality vs BTreeMap's contiguous nodes; explore arena-based slot
     storage (remaining).
-  - **5b — Key generalization & API gaps**: Relax `Key: Copy` to support
-    `[u8; N]`, fixed-size byte arrays, and eventually `AsRef<[u8]>` key types.
-    This is the single biggest blocker for real-world adoption (no strings, UUIDs,
-    or compound keys today). Add `entry` API / `get_or_insert` for atomic
+  - **5b — Key generalization & API gaps**: Relax `Key: Copy` to `Key: Clone`
+    and support `[u8; N]` fixed-size byte arrays (done — enables UUIDs, hashes,
+    and other fixed-width binary keys). `AsRef<[u8]>` for heap-allocated keys
+    like `String` is remaining — requires storing keys behind `Arc` or similar
+    in `SlotInner` to avoid lifetime issues with epoch-based reclamation.
+    Add `entry` API / `get_or_insert` for atomic
     check-and-insert. `clear()` (done) / `drain()` (done). `bulk_load_dedup`
     variant that deduplicates instead of rejecting duplicates (done). `len()`
     approximation documented on all four callsites (done).
