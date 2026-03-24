@@ -135,6 +135,13 @@ impl<K: Key, V: Clone + Send + Sync> MapRef<'_, K, V> {
         self.map.range_count(range, &self.guard)
     }
 
+    /// Estimate the total heap memory allocated by this map, in bytes.
+    ///
+    /// See [`LearnedMap::allocated_bytes`] for details.
+    pub fn allocated_bytes(&self) -> usize {
+        self.map.allocated_bytes(&self.guard)
+    }
+
     /// Return the maximum depth of the tree.
     pub fn max_depth(&self) -> usize {
         self.map.max_depth(&self.guard)
@@ -491,6 +498,20 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// Count the number of entries within the given range.
     pub fn range_count<R: RangeBounds<K>>(&self, range: R, guard: &Guard) -> usize {
         self.range(range, guard).count()
+    }
+
+    /// Estimate the total heap memory allocated by this map, in bytes.
+    ///
+    /// Walks the entire tree and sums up node structs, slot arrays, and
+    /// per-entry allocations. This is an approximation — it does not account
+    /// for allocator overhead, alignment padding, or epoch-deferred garbage.
+    ///
+    /// Useful for monitoring memory usage in long-running processes.
+    pub fn allocated_bytes(&self, guard: &Guard) -> usize {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        // SAFETY: root is always non-null.
+        let root = unsafe { root_shared.deref() };
+        root.allocated_bytes(&guard.inner)
     }
 
     /// Return the maximum depth of the tree.
@@ -1222,5 +1243,55 @@ mod tests {
         let drained = m.drain();
         assert_eq!(drained, vec![(1, "a"), (2, "b"), (3, "c")]);
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn allocated_bytes_empty() {
+        let map = LearnedMap::<u64, u64>::new();
+        let g = map.guard();
+        let bytes = map.allocated_bytes(&g);
+        // An empty map still has the root node + slot array.
+        assert!(bytes > 0, "empty map should have non-zero allocation");
+    }
+
+    #[test]
+    fn allocated_bytes_grows_with_entries() {
+        let map = LearnedMap::new();
+        let g = map.guard();
+        let empty_bytes = map.allocated_bytes(&g);
+
+        for i in 0..100u64 {
+            map.insert(i, i, &g);
+        }
+        let g2 = map.guard();
+        let full_bytes = map.allocated_bytes(&g2);
+        assert!(
+            full_bytes > empty_bytes,
+            "100 entries should use more memory than empty: {full_bytes} vs {empty_bytes}"
+        );
+    }
+
+    #[test]
+    fn allocated_bytes_bulk_load() {
+        let pairs: Vec<(u64, u64)> = (0..500).map(|i| (i, i)).collect();
+        let map = LearnedMap::bulk_load(&pairs).unwrap();
+        let g = map.guard();
+        let bytes = map.allocated_bytes(&g);
+        // Sanity: at minimum each entry occupies size_of key + value in a SlotInner.
+        let min_data_bytes = 500 * std::mem::size_of::<u64>() * 2;
+        assert!(
+            bytes > min_data_bytes,
+            "allocated_bytes {bytes} is less than minimum data size {min_data_bytes}"
+        );
+    }
+
+    #[test]
+    fn map_ref_allocated_bytes() {
+        let map = LearnedMap::new();
+        let m = map.pin();
+        m.insert(1u64, 1u64);
+        m.insert(2, 2);
+        let bytes = m.allocated_bytes();
+        assert!(bytes > 0);
     }
 }

@@ -120,6 +120,39 @@ impl<K: Key, V> Node<K, V> {
         count
     }
 
+    /// Estimate the total heap memory used by this node and all descendants.
+    ///
+    /// The estimate includes:
+    /// - The `Node` struct itself (`size_of::<Node<K, V>>()`)
+    /// - The boxed slot array (`capacity * size_of::<Atomic<SlotInner<K, V>>>()`)
+    /// - Each non-null slot's heap-allocated `SlotInner` (`size_of::<SlotInner<K, V>>()`)
+    /// - Recursive child nodes
+    ///
+    /// This is an approximation — it does not account for allocator overhead,
+    /// alignment padding, or epoch-deferred garbage.
+    pub fn allocated_bytes(&self, guard: &Guard) -> usize {
+        let node_size = std::mem::size_of::<Self>();
+        let slots_size =
+            self.slots.len() * std::mem::size_of::<Atomic<SlotInner<K, V>>>();
+        let inner_size = std::mem::size_of::<SlotInner<K, V>>();
+
+        let mut total = node_size + slots_size;
+
+        for slot in &*self.slots {
+            let shared = slot.load(Ordering::Acquire, guard);
+            if shared.is_null() {
+                continue;
+            }
+            total += inner_size;
+            // SAFETY: shared is not null and is valid for the lifetime of the guard.
+            if let SlotInner::Child(child) = unsafe { shared.deref() } {
+                total += child.allocated_bytes(guard);
+            }
+        }
+
+        total
+    }
+
     /// Return the depth of the deepest path from this node.
     pub fn max_depth(&self, guard: &Guard) -> usize {
         let mut max_child_depth = 0;
