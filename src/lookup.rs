@@ -14,7 +14,7 @@ use crate::node::{Node, SlotInner};
 pub fn get<'g, K: Key, V>(node: &Node<K, V>, key: &K, guard: &'g Guard) -> Option<&'g V> {
     let mut current_node = node;
     loop {
-        let slot_idx = current_node.predict_slot(*key);
+        let slot_idx = current_node.predict_slot(key);
         let shared: Shared<'g, SlotInner<K, V>> =
             current_node.slot(slot_idx).load(Ordering::Acquire, guard);
 

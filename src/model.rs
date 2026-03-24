@@ -52,7 +52,7 @@ impl LinearModel {
     ///
     /// Returns the predicted position clamped to `[0, array_size - 1]`.
     #[inline]
-    pub fn predict<K: Key>(&self, key: K, array_size: usize) -> usize {
+    pub fn predict<K: Key>(&self, key: &K, array_size: usize) -> usize {
         if let Some(mid) = self.midpoint {
             return if key.to_exact_ordinal() <= mid {
                 0
@@ -213,8 +213,8 @@ pub fn fit_fmcd<K: Key>(keys: &[K], expansion_factor: f64, range_headroom: f64) 
 /// if adjacent keys map to the same slot (no allocation needed).
 fn count_conflicts_fast<K: Key>(keys: &[K], model: &LinearModel, array_size: usize) -> usize {
     let mut conflicts = 0;
-    let mut prev_slot = model.predict(keys[0], array_size);
-    for &key in &keys[1..] {
+    let mut prev_slot = model.predict(&keys[0], array_size);
+    for key in &keys[1..] {
         let slot = model.predict(key, array_size);
         if slot == prev_slot {
             conflicts += 1;
@@ -231,7 +231,7 @@ fn count_conflicts_fast<K: Key>(keys: &[K], model: &LinearModel, array_size: usi
 fn count_conflicts<K: Key>(keys: &[K], model: &LinearModel, array_size: usize) -> usize {
     let mut occupied = vec![false; array_size];
     let mut conflicts = 0;
-    for &key in keys {
+    for key in keys {
         let slot = model.predict(key, array_size);
         if occupied[slot] {
             conflicts += 1;
@@ -251,7 +251,7 @@ mod tests {
         let result = fit_fmcd(&[42u64], 2.0, 0.0);
         assert_eq!(result.array_size, 1);
         assert_eq!(result.conflicts, 0);
-        assert_eq!(result.model.predict(42u64, 1), 0);
+        assert_eq!(result.model.predict(&42u64, 1), 0);
     }
 
     #[test]
@@ -259,8 +259,8 @@ mod tests {
         let result = fit_fmcd(&[10u64, 20], 2.0, 0.0);
         assert_eq!(result.conflicts, 0);
         assert!(result.array_size >= 2);
-        let s1 = result.model.predict(10u64, result.array_size);
-        let s2 = result.model.predict(20u64, result.array_size);
+        let s1 = result.model.predict(&10u64, result.array_size);
+        let s2 = result.model.predict(&20u64, result.array_size);
         assert_ne!(s1, s2, "two keys should map to different slots");
     }
 
@@ -284,9 +284,9 @@ mod tests {
     #[test]
     fn predict_clamps_to_range() {
         let model = LinearModel::new(1.0, -10.0);
-        assert_eq!(model.predict(5u64, 100), 0);
+        assert_eq!(model.predict(&5u64, 100), 0);
         let model2 = LinearModel::new(1.0, 1000.0);
-        assert_eq!(model2.predict(5u64, 100), 99);
+        assert_eq!(model2.predict(&5u64, 100), 99);
     }
 
     #[test]
@@ -336,7 +336,7 @@ mod tests {
         let result = fit_fmcd(&keys, 2.0, 0.0);
         let positions: Vec<usize> = keys
             .iter()
-            .map(|&k| result.model.predict(k, result.array_size))
+            .map(|k| result.model.predict(k, result.array_size))
             .collect();
         for pair in positions.windows(2) {
             assert!(
@@ -357,12 +357,12 @@ mod tests {
         let model = LinearModel::binary_split(midpoint);
 
         // array_size = 2: should map lo to 0, hi to 1
-        assert_eq!(model.predict(base, 2), 0);
-        assert_eq!(model.predict(base + 1, 2), 1);
+        assert_eq!(model.predict(&base, 2), 0);
+        assert_eq!(model.predict(&(base + 1), 2), 1);
 
         // array_size = 4: should map lo to 0, hi to 3
-        assert_eq!(model.predict(base, 4), 0);
-        assert_eq!(model.predict(base + 1, 4), 3);
+        assert_eq!(model.predict(&base, 4), 0);
+        assert_eq!(model.predict(&(base + 1), 4), 3);
     }
 
     #[test]
@@ -373,10 +373,10 @@ mod tests {
         let model = LinearModel::binary_split(mid);
 
         for i in 0..=4u64 {
-            assert_eq!(model.predict(base + i, 2), 0, "base+{i} should go to slot 0");
+            assert_eq!(model.predict(&(base + i), 2), 0, "base+{i} should go to slot 0");
         }
         for i in 5..10u64 {
-            assert_eq!(model.predict(base + i, 2), 1, "base+{i} should go to slot 1");
+            assert_eq!(model.predict(&(base + i), 2), 1, "base+{i} should go to slot 1");
         }
     }
 
@@ -432,7 +432,7 @@ mod tests {
         let result = fit_fmcd(&keys, 2.0, 1.0);
         // With headroom=1.0, the last key should map to approximately
         // the middle of the array, not the end.
-        let last_slot = result.model.predict(99u64, result.array_size);
+        let last_slot = result.model.predict(&99u64, result.array_size);
         let midpoint = result.array_size / 2;
         assert!(
             last_slot <= midpoint + midpoint / 4,

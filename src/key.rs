@@ -1,6 +1,6 @@
 //! The [`Key`] trait for types usable as learned index keys.
 //!
-//! Keys must be ordered, copyable, and convertible to `f64` for linear model
+//! Keys must be ordered, clonable, and convertible to `f64` for linear model
 //! prediction. This conversion must be monotonic: if `a < b` then
 //! `a.to_model_input() < b.to_model_input()`.
 
@@ -18,19 +18,19 @@
 ///   linear models can fit the key distribution effectively.
 /// - `to_exact_ordinal` must be a **strictly monotonic, injective** function:
 ///   if `a < b` then `a.to_exact_ordinal() < b.to_exact_ordinal()`.
-pub trait Key: Copy + Ord + Send + Sync + std::fmt::Debug + 'static {
+pub trait Key: Clone + Ord + Send + Sync + std::fmt::Debug + 'static {
     /// Convert this key to a `f64` value for model prediction.
     ///
     /// The conversion must be monotonic and return a finite value. It may
     /// be non-injective for large integer keys (precision loss above 2^53).
-    fn to_model_input(self) -> f64;
+    fn to_model_input(&self) -> f64;
 
     /// Convert this key to a lossless `i128` for exact comparison.
     ///
     /// This must be strictly monotonic and injective: if `a < b` then
     /// `a.to_exact_ordinal() < b.to_exact_ordinal()`. Used as a fallback
     /// for conflict resolution when `to_model_input` cannot distinguish keys.
-    fn to_exact_ordinal(self) -> i128;
+    fn to_exact_ordinal(&self) -> i128;
 }
 
 macro_rules! impl_key_unsigned {
@@ -38,13 +38,13 @@ macro_rules! impl_key_unsigned {
         $(
             impl Key for $t {
                 #[inline]
-                fn to_model_input(self) -> f64 {
-                    self as f64
+                fn to_model_input(&self) -> f64 {
+                    *self as f64
                 }
 
                 #[inline]
-                fn to_exact_ordinal(self) -> i128 {
-                    self as i128
+                fn to_exact_ordinal(&self) -> i128 {
+                    *self as i128
                 }
             }
         )*
@@ -56,13 +56,13 @@ macro_rules! impl_key_signed {
         $(
             impl Key for $t {
                 #[inline]
-                fn to_model_input(self) -> f64 {
-                    self as f64
+                fn to_model_input(&self) -> f64 {
+                    *self as f64
                 }
 
                 #[inline]
-                fn to_exact_ordinal(self) -> i128 {
-                    self as i128
+                fn to_exact_ordinal(&self) -> i128 {
+                    *self as i128
                 }
             }
         )*
@@ -76,28 +76,28 @@ impl_key_signed!(i8, i16, i32, i64);
 // to_exact_ordinal is fully injective for all values.
 impl Key for u128 {
     #[inline]
-    fn to_model_input(self) -> f64 {
-        self as f64
+    fn to_model_input(&self) -> f64 {
+        *self as f64
     }
 
     #[inline]
     #[allow(clippy::cast_possible_wrap)]
-    fn to_exact_ordinal(self) -> i128 {
+    fn to_exact_ordinal(&self) -> i128 {
         // Order-preserving bijection: flip the sign bit so that
         // 0u128 -> i128::MIN and u128::MAX -> i128::MAX.
-        (self as i128) ^ i128::MIN
+        (*self as i128) ^ i128::MIN
     }
 }
 
 impl Key for i128 {
     #[inline]
-    fn to_model_input(self) -> f64 {
-        self as f64
+    fn to_model_input(&self) -> f64 {
+        *self as f64
     }
 
     #[inline]
-    fn to_exact_ordinal(self) -> i128 {
-        self
+    fn to_exact_ordinal(&self) -> i128 {
+        *self
     }
 }
 

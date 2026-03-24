@@ -12,7 +12,7 @@ use crate::node::{Node, SlotInner};
 pub fn remove<K: Key, V>(node: &Node<K, V>, key: &K, guard: &Guard) -> bool {
     let mut current_node = node;
     loop {
-        let slot_idx = current_node.predict_slot(*key);
+        let slot_idx = current_node.predict_slot(key);
         let slot = current_node.slot(slot_idx);
         let current = slot.load(Ordering::Acquire, guard);
 

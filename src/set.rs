@@ -90,7 +90,7 @@ impl<K: Key> LearnedSet<K> {
     ///
     /// Returns an error if `keys` is empty or not sorted.
     pub fn bulk_load(keys: &[K]) -> Result<Self> {
-        let pairs: Vec<(K, ())> = keys.iter().map(|&k| (k, ())).collect();
+        let pairs: Vec<(K, ())> = keys.iter().map(|k| (k.clone(), ())).collect();
         Ok(Self {
             inner: LearnedMap::bulk_load(&pairs)?,
         })

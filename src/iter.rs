@@ -94,7 +94,7 @@ impl<'g, K: Key, V> Iterator for Iter<'g, K, V> {
 /// naturally produces sorted output (see [`Iter`] docs).
 pub fn sorted_pairs<K: Key, V: Clone>(root: &Node<K, V>, guard: &Guard) -> Vec<(K, V)> {
     let iter = Iter::new(root, guard);
-    iter.map(|(k, v)| (*k, v.clone())).collect()
+    iter.map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
 /// A range iterator over key-value pairs in a learned index.
@@ -121,28 +121,35 @@ impl<'g, K: Key, V> Range<'g, K, V> {
     /// Create a new range iterator over the given bounds.
     pub fn new<R: RangeBounds<K>>(root: &'g Node<K, V>, range: R, guard: &'g Guard) -> Self {
         let start = match range.start_bound() {
-            Bound::Included(&k) => Bound::Included(k),
-            Bound::Excluded(&k) => Bound::Excluded(k),
+            Bound::Included(k) => Bound::Included(k.clone()),
+            Bound::Excluded(k) => Bound::Excluded(k.clone()),
             Bound::Unbounded => Bound::Unbounded,
         };
         let end = match range.end_bound() {
-            Bound::Included(&k) => Bound::Included(k),
-            Bound::Excluded(&k) => Bound::Excluded(k),
+            Bound::Included(k) => Bound::Included(k.clone()),
+            Bound::Excluded(k) => Bound::Excluded(k.clone()),
             Bound::Unbounded => Bound::Unbounded,
         };
+
+        let is_unbounded = matches!(&start, Bound::Unbounded);
 
         let mut iter = Self {
             stack: Vec::new(),
             guard,
             start,
             end,
-            started: matches!(start, Bound::Unbounded),
+            started: is_unbounded,
             done: false,
         };
 
-        match start {
-            Bound::Included(k) | Bound::Excluded(k) => iter.seek_to(root, k),
-            Bound::Unbounded => iter.stack.push((root, 0)),
+        let seek_key = match &iter.start {
+            Bound::Included(k) | Bound::Excluded(k) => Some(k.clone()),
+            Bound::Unbounded => None,
+        };
+        if let Some(ref k) = seek_key {
+            iter.seek_to(root, k);
+        } else {
+            iter.stack.push((root, 0));
         }
 
         iter
@@ -153,7 +160,7 @@ impl<'g, K: Key, V> Range<'g, K, V> {
     /// At each level, predicts the slot for `key` and pushes the node starting
     /// at that slot. If the slot contains a child, pushes a continuation for the
     /// parent at `slot + 1` and recurses into the child.
-    fn seek_to(&mut self, node: &'g Node<K, V>, key: K) {
+    fn seek_to(&mut self, node: &'g Node<K, V>, key: &K) {
         let p = node.predict_slot(key);
         let shared = node.slot(p).load(Ordering::Acquire, self.guard);
         if !shared.is_null() {

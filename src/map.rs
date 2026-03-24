@@ -353,6 +353,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// change and retries against the new root. A `was_new` flag tracks
     /// whether the key was newly inserted across retries so `len` is
     /// incremented exactly once.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
         let mut was_new = false;
         loop {
@@ -364,7 +365,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             }
             // SAFETY: root is always non-null.
             let root = unsafe { root_shared.deref() };
-            let result = insert::insert(root, key, &value, &self.config, &guard.inner);
+            let result = insert::insert(root, key.clone(), &value, &self.config, &guard.inner);
             // Validate: root wasn't replaced or frozen by a concurrent rebuild.
             if self.root.load(Ordering::Acquire, &guard.inner) != root_shared {
                 if result == InsertResult::Inserted {

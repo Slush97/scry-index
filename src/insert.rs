@@ -38,7 +38,7 @@ pub enum InsertResult {
 /// If a concurrent rebuild replaces a subtree on the insert's descent path,
 /// the insert detects the change via a post-CAS validation and retries from
 /// the root of `node`.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 pub fn insert<K: Key, V: Clone + Send + Sync>(
     node: &Node<K, V>,
     key: K,
@@ -67,7 +67,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
         )> = None;
 
         loop {
-            let slot_idx = current_node.predict_slot(key);
+            let slot_idx = current_node.predict_slot(&key);
             let slot = current_node.slot(slot_idx);
 
             let current = slot.load(Ordering::Acquire, guard);
@@ -75,7 +75,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
             if current.is_null() {
                 // Empty slot: CAS null → Data
                 let new = Owned::new(SlotInner::Data {
-                    key,
+                    key: key.clone(),
                     value: value.clone(),
                 });
                 if slot
@@ -113,10 +113,10 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                     key: existing_key,
                     value: existing_value,
                 } => {
-                    if *existing_key == key {
+                    if existing_key == &key {
                         // Same key: CAS old Data → new Data (update)
                         let new = Owned::new(SlotInner::Data {
-                            key,
+                            key: key.clone(),
                             value: value.clone(),
                         });
                         if slot
@@ -149,9 +149,9 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                         continue;
                     }
                     // Collision: build child containing both entries, CAS old → Child
-                    let ek = *existing_key;
+                    let ek = existing_key.clone();
                     let ev = existing_value.clone();
-                    let child = build_conflict_node(ek, ev, key, value.clone(), config);
+                    let child = build_conflict_node(ek, ev, key.clone(), value.clone(), config);
                     let new = Owned::new(SlotInner::Child(child));
                     if slot
                         .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire, guard)
@@ -243,8 +243,8 @@ fn build_conflict_node<K: Key, V: Clone + Send + Sync>(
 
     let node = Node::with_capacity(model, array_size);
 
-    let s1 = node.predict_slot(lo_k);
-    let s2 = node.predict_slot(hi_k);
+    let s1 = node.predict_slot(&lo_k);
+    let s2 = node.predict_slot(&hi_k);
 
     node.store_slot(
         s1,

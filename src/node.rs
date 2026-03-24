@@ -59,7 +59,7 @@ impl<K: Key, V> Node<K, V> {
 
     /// Predict the slot index for a key.
     #[inline]
-    pub fn predict_slot(&self, key: K) -> usize {
+    pub fn predict_slot(&self, key: &K) -> usize {
         self.model.predict(key, self.slots.len())
     }
 

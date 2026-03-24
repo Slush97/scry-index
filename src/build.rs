@@ -32,7 +32,7 @@ pub fn bulk_load<K: Key, V: Clone>(pairs: &[(K, V)], config: &Config) -> Result<
 
 /// Recursively build a subtree from a sorted slice of key-value pairs.
 pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Config) -> Node<K, V> {
-    let keys: Vec<K> = pairs.iter().map(|(k, _)| *k).collect();
+    let keys: Vec<K> = pairs.iter().map(|(k, _)| k.clone()).collect();
     let n = keys.len();
 
     // Check for degenerate case: all keys share the same f64 model input.
@@ -54,11 +54,11 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
     if result.conflicts == 0 {
         // No conflicts — place each key-value directly in its predicted slot
         for (key, value) in pairs {
-            let slot = node.predict_slot(*key);
+            let slot = node.predict_slot(key);
             node.store_slot(
                 slot,
                 SlotInner::Data {
-                    key: *key,
+                    key: key.clone(),
                     value: value.clone(),
                 },
             );
@@ -71,7 +71,7 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
         let mut assignments: Vec<(usize, usize)> = pairs
             .iter()
             .enumerate()
-            .map(|(i, (k, _))| (node.predict_slot(*k), i))
+            .map(|(i, (k, _))| (node.predict_slot(k), i))
             .collect();
         assignments.sort_unstable_by_key(|&(slot, _)| slot);
 
@@ -88,7 +88,7 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
                 node.store_slot(
                     slot_idx,
                     SlotInner::Data {
-                        key: *k,
+                        key: k.clone(),
                         value: v.clone(),
                     },
                 );
@@ -98,7 +98,7 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
                     .iter()
                     .map(|&(_, idx)| {
                         let (k, v) = &pairs[idx];
-                        (*k, v.clone())
+                        (k.clone(), v.clone())
                     })
                     .collect();
                 // Check if this conflict group is degenerate (all same f64).
@@ -140,7 +140,7 @@ fn build_degenerate<K: Key, V: Clone>(pairs: &[(K, V)]) -> Node<K, V> {
         node.store_slot(
             0,
             SlotInner::Data {
-                key: pairs[0].0,
+                key: pairs[0].0.clone(),
                 value: pairs[0].1.clone(),
             },
         );
@@ -164,7 +164,7 @@ fn build_degenerate<K: Key, V: Clone>(pairs: &[(K, V)]) -> Node<K, V> {
         node.store_slot(
             0,
             SlotInner::Data {
-                key: lo_half[0].0,
+                key: lo_half[0].0.clone(),
                 value: lo_half[0].1.clone(),
             },
         );
@@ -178,7 +178,7 @@ fn build_degenerate<K: Key, V: Clone>(pairs: &[(K, V)]) -> Node<K, V> {
         node.store_slot(
             1,
             SlotInner::Data {
-                key: hi_half[0].0,
+                key: hi_half[0].0.clone(),
                 value: hi_half[0].1.clone(),
             },
         );
