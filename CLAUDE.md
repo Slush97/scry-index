@@ -72,7 +72,9 @@ src/
     like `String` is remaining — requires storing keys behind `Arc` or similar
     in `SlotInner` to avoid lifetime issues with epoch-based reclamation.
     Add `entry` API / `get_or_insert` for atomic
-    check-and-insert. `clear()` (done) / `drain()` (done). `bulk_load_dedup`
+    check-and-insert (done — `get_or_insert` and `get_or_insert_with` on
+    `LearnedMap` and `MapRef`; atomic CAS-based, no TOCTOU race).
+    `clear()` (done) / `drain()` (done). `bulk_load_dedup`
     variant that deduplicates instead of rejecting duplicates (done). `len()`
     approximation documented on all four callsites (done).
   - **5c — Durability & operational readiness**: Rebuild-under-concurrency must

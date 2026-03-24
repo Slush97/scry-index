@@ -979,3 +979,135 @@ fn concurrent_remove_tombstone_compaction() {
         );
     }
 }
+
+/// 8 threads race to get_or_insert the same key — exactly one wins the insert,
+/// all see the same value.
+#[test]
+fn concurrent_get_or_insert_same_key() {
+    let map = Arc::new(LearnedMap::new());
+    let barrier = Arc::new(Barrier::new(8));
+    let winner_values = Arc::new(Mutex::new(Vec::new()));
+
+    let handles: Vec<_> = (0..8u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            let winner_values = Arc::clone(&winner_values);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                // Each thread tries to insert its own thread-id as the value
+                let val = map.get_or_insert(42u64, t, &guard);
+                winner_values.lock().unwrap().push(*val);
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // All threads should have gotten the same value
+    let values = winner_values.lock().unwrap();
+    assert_eq!(values.len(), 8);
+    let first = values[0];
+    for &v in values.iter() {
+        assert_eq!(v, first, "all threads should see the same value");
+    }
+    // The winning value should be one of the thread ids (0..8)
+    assert!(first < 8, "winner should be a thread id");
+    assert_eq!(map.len(), 1);
+}
+
+/// Multiple threads do get_or_insert on disjoint keys — all inserts succeed.
+#[test]
+fn concurrent_get_or_insert_disjoint_keys() {
+    let map = Arc::new(LearnedMap::new());
+    let barrier = Arc::new(Barrier::new(8));
+
+    let handles: Vec<_> = (0..8u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                let base = t * 500;
+                for i in 0..500 {
+                    let key = base + i;
+                    let val = map.get_or_insert(key, key * 10, &guard);
+                    assert_eq!(*val, key * 10);
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert_eq!(map.len(), 4000);
+    let guard = map.guard();
+    for i in 0..4000u64 {
+        assert_eq!(
+            map.get(&i, &guard),
+            Some(&(i * 10)),
+            "key {i} has wrong value"
+        );
+    }
+}
+
+/// Mixed: get_or_insert interleaved with regular insert/get/remove across threads.
+#[test]
+fn concurrent_get_or_insert_mixed_ops() {
+    let map = Arc::new(LearnedMap::with_config(Config::new().auto_rebuild(false)));
+    let barrier = Arc::new(Barrier::new(8));
+
+    // 4 threads do regular inserts
+    let writer_handles: Vec<_> = (0..4u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                for i in 0..200 {
+                    let key = i * 4 + t;
+                    map.insert(key, key, &guard);
+                }
+            })
+        })
+        .collect();
+
+    // 4 threads do get_or_insert on overlapping keys
+    let goi_handles: Vec<_> = (0..4u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                for i in 0..200 {
+                    let key = i * 4 + t;
+                    let _val = map.get_or_insert(key, key + 10_000, &guard);
+                }
+            })
+        })
+        .collect();
+
+    for h in writer_handles {
+        h.join().unwrap();
+    }
+    for h in goi_handles {
+        h.join().unwrap();
+    }
+
+    // All keys should be present
+    let guard = map.guard();
+    for i in 0..800u64 {
+        assert!(
+            map.get(&i, &guard).is_some(),
+            "key {i} missing after mixed concurrent ops"
+        );
+    }
+}

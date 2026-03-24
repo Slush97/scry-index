@@ -1051,6 +1051,179 @@ fn tombstone_compaction_disabled() {
 }
 
 #[test]
+fn get_or_insert_absent_key() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    let val = map.get_or_insert(42u64, "hello", &g);
+    assert_eq!(*val, "hello");
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.get(&42, &g), Some(&"hello"));
+}
+
+#[test]
+fn get_or_insert_existing_key_returns_original() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(42u64, "first", &g);
+    let val = map.get_or_insert(42, "second", &g);
+    assert_eq!(*val, "first"); // original value, not "second"
+    assert_eq!(map.len(), 1);
+}
+
+#[test]
+fn get_or_insert_idempotent() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    let v1 = map.get_or_insert(10u64, 100, &g);
+    let v2 = map.get_or_insert(10, 999, &g);
+    assert_eq!(*v1, 100);
+    assert_eq!(*v2, 100);
+    assert_eq!(map.len(), 1);
+}
+
+#[test]
+fn get_or_insert_does_not_increment_len_on_existing() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(1u64, "a", &g);
+    map.insert(2, "b", &g);
+    assert_eq!(map.len(), 2);
+    map.get_or_insert(1, "x", &g);
+    map.get_or_insert(2, "y", &g);
+    assert_eq!(map.len(), 2); // unchanged
+}
+
+#[test]
+fn get_or_insert_with_closure_not_called_when_exists() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    map.insert(5u64, 50, &g);
+    let mut called = false;
+    let val = map.get_or_insert_with(5, || {
+        called = true;
+        999
+    }, &g);
+    assert!(!called);
+    assert_eq!(*val, 50);
+}
+
+#[test]
+fn get_or_insert_with_calls_closure_when_absent() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    let mut called = false;
+    let val = map.get_or_insert_with(5u64, || {
+        called = true;
+        999
+    }, &g);
+    assert!(called);
+    assert_eq!(*val, 999);
+    assert_eq!(map.len(), 1);
+}
+
+#[test]
+fn get_or_insert_mixed_with_regular_ops() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+
+    // Regular inserts
+    map.insert(1u64, 10, &g);
+    map.insert(2, 20, &g);
+
+    // get_or_insert on existing key
+    let v = map.get_or_insert(1, 999, &g);
+    assert_eq!(*v, 10);
+
+    // get_or_insert on new key
+    let v = map.get_or_insert(3, 30, &g);
+    assert_eq!(*v, 30);
+    assert_eq!(map.len(), 3);
+
+    // Remove and re-insert via get_or_insert
+    map.remove(&2, &g);
+    let v = map.get_or_insert(2, 200, &g);
+    assert_eq!(*v, 200);
+    assert_eq!(map.len(), 3);
+
+    // Regular get still works
+    assert_eq!(map.get(&1, &g), Some(&10));
+    assert_eq!(map.get(&2, &g), Some(&200));
+    assert_eq!(map.get(&3, &g), Some(&30));
+}
+
+#[test]
+fn get_or_insert_bulk_loaded() {
+    let pairs: Vec<(u64, u64)> = (0..100).map(|i| (i * 2, i)).collect();
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+
+    // Existing keys: should return original values
+    for i in 0..100u64 {
+        let v = map.get_or_insert(i * 2, 9999, &g);
+        assert_eq!(*v, i, "key {} should have original value", i * 2);
+    }
+    assert_eq!(map.len(), 100);
+
+    // New keys: should insert
+    for i in 0..100u64 {
+        let v = map.get_or_insert(i * 2 + 1, i + 1000, &g);
+        assert_eq!(*v, i + 1000);
+    }
+    assert_eq!(map.len(), 200);
+}
+
+#[test]
+fn get_or_insert_byte_array_keys() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+
+    let k1: [u8; 4] = [0, 0, 0, 1];
+    let k2: [u8; 4] = [0, 0, 0, 2];
+    let k3: [u8; 4] = [0, 0, 0, 3];
+
+    let v1 = map.get_or_insert(k1, "one", &g);
+    assert_eq!(*v1, "one");
+
+    let v2 = map.get_or_insert(k2, "two", &g);
+    assert_eq!(*v2, "two");
+
+    // Existing key returns original
+    let v1_again = map.get_or_insert(k1, "replaced", &g);
+    assert_eq!(*v1_again, "one");
+
+    let v3 = map.get_or_insert(k3, "three", &g);
+    assert_eq!(*v3, "three");
+
+    assert_eq!(map.len(), 3);
+}
+
+#[test]
+fn get_or_insert_map_ref() {
+    let map = LearnedMap::new();
+    let m = map.pin();
+    let v1 = m.get_or_insert(1u64, "a");
+    assert_eq!(*v1, "a");
+    let v2 = m.get_or_insert(1, "b");
+    assert_eq!(*v2, "a"); // original
+    assert_eq!(m.len(), 1);
+}
+
+#[test]
+fn get_or_insert_with_map_ref() {
+    let map = LearnedMap::new();
+    let m = map.pin();
+    let v = m.get_or_insert_with(7u64, || 70);
+    assert_eq!(*v, 70);
+    let mut called = false;
+    let v2 = m.get_or_insert_with(7, || {
+        called = true;
+        999
+    });
+    assert!(!called);
+    assert_eq!(*v2, 70);
+}
+
+#[test]
 fn tombstone_compaction_then_reinsert() {
     let map = LearnedMap::new();
     let g = map.guard();

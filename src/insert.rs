@@ -204,6 +204,159 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
     } // 'retry
 }
 
+/// Atomically get an existing value or insert a new one.
+///
+/// If the key already exists, returns a reference to the existing value and
+/// [`InsertResult::Updated`] (signalling "already existed — no insert performed").
+/// If the key is absent, inserts the key-value pair and returns a reference to
+/// the new value with [`InsertResult::Inserted`].
+///
+/// Unlike [`insert`], this function never overwrites an existing value.
+///
+/// The returned reference is valid for the lifetime of the `guard`.
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
+    node: &Node<K, V>,
+    key: K,
+    value: &V,
+    config: &Config,
+    guard: &'g Guard,
+) -> (&'g V, InsertResult) {
+    let mut retry_was_new = false;
+
+    'retry: loop {
+        let mut current_node = node;
+        let mut depth: usize = 0;
+        let mut rebuild_candidate: Option<(&Node<K, V>, usize)> = None;
+        #[allow(clippy::type_complexity)]
+        let mut descent_snapshot: Option<(
+            &Node<K, V>,
+            usize,
+            Shared<'_, SlotInner<K, V>>,
+        )> = None;
+
+        loop {
+            let slot_idx = current_node.predict_slot(&key);
+            let slot = current_node.slot(slot_idx);
+
+            let current = slot.load(Ordering::Acquire, guard);
+
+            if current.is_null() {
+                // Empty slot: CAS null → Data
+                let new = Owned::new(SlotInner::Data {
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+                match slot.compare_exchange(
+                    current,
+                    new,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    guard,
+                ) {
+                    Ok(shared) => {
+                        current_node.inc_keys();
+                        if let Some((parent, pidx, expected)) = descent_snapshot {
+                            if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
+                                retry_was_new = true;
+                                continue 'retry;
+                            }
+                        }
+                        if config.auto_rebuild && depth > config.rebuild_depth_threshold {
+                            if let Some((parent, idx)) = rebuild_candidate {
+                                crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
+                            }
+                        }
+                        // SAFETY: shared is the value we just CAS'd in, valid for 'g.
+                        let inner = unsafe { shared.deref() };
+                        if let SlotInner::Data { value: v, .. } = inner {
+                            return (v, InsertResult::Inserted);
+                        }
+                        // Structurally unreachable: we CAS'd a Data variant.
+                        // Fall through to re-read the slot on the next iteration.
+                        continue;
+                    }
+                    Err(_) => continue,
+                }
+            }
+
+            // SAFETY: current is not null and valid for the lifetime of the guard.
+            let inner = unsafe { current.deref() };
+
+            match inner {
+                SlotInner::Data {
+                    key: existing_key,
+                    value: existing_value,
+                } => {
+                    if existing_key == &key {
+                        // Same key: return existing value, don't update.
+                        let result = if retry_was_new {
+                            InsertResult::Inserted
+                        } else {
+                            InsertResult::Updated
+                        };
+                        return (existing_value, result);
+                    }
+                    // Collision: build child containing both entries, CAS old → Child
+                    let ek = existing_key.clone();
+                    let ev = existing_value.clone();
+                    let child = build_conflict_node(ek, ev, key.clone(), value.clone(), config);
+                    let new = Owned::new(SlotInner::Child(child));
+                    if let Ok(shared) = slot.compare_exchange(
+                        current,
+                        new,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        guard,
+                    ) {
+                        // SAFETY: CAS succeeded; old Data is unreachable to new readers.
+                        unsafe {
+                            guard.defer_destroy(current);
+                        }
+                        current_node.dec_keys(); // existing data moved to child
+                        if let Some((parent, pidx, expected)) = descent_snapshot {
+                            if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
+                                retry_was_new = true;
+                                continue 'retry;
+                            }
+                        }
+                        if config.auto_rebuild && depth > config.rebuild_depth_threshold {
+                            if let Some((parent, idx)) = rebuild_candidate {
+                                crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
+                            }
+                        }
+                        // Look up the value we just inserted in the new child.
+                        // SAFETY: shared is the Child we just CAS'd in, valid for 'g.
+                        let child_inner = unsafe { shared.deref() };
+                        if let SlotInner::Child(child_node) = child_inner {
+                            if let Some(val) =
+                                crate::lookup::get(child_node, &key, guard)
+                            {
+                                return (val, InsertResult::Inserted);
+                            }
+                        }
+                        // Should not happen by construction; loop retries.
+                    }
+                }
+                SlotInner::Child(child) => {
+                    if current.tag() != 0 {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    depth += 1;
+                    if rebuild_candidate.is_none() {
+                        rebuild_candidate = Some((current_node, slot_idx));
+                    }
+                    if descent_snapshot.is_none() {
+                        descent_snapshot = Some((current_node, slot_idx, current));
+                    }
+                    current_node = child;
+                }
+            }
+        }
+    } // 'retry
+}
+
 /// Build a small child node from two conflicting key-value pairs.
 ///
 /// Uses direct placement into a 4-slot node instead of full FMCD fitting.
@@ -468,6 +621,79 @@ mod tests {
                 Some(&(base + i)),
                 "key base+{i} not found"
             );
+        }
+    }
+
+    #[test]
+    fn get_or_insert_empty_slot() {
+        let g = guard();
+        let node = empty_root();
+        let (val, result) = get_or_insert(&node, 50, &500, &cfg(), &g);
+        assert_eq!(result, InsertResult::Inserted);
+        assert_eq!(*val, 500);
+        assert_eq!(node.total_keys(&g), 1);
+    }
+
+    #[test]
+    fn get_or_insert_existing_no_update() {
+        let g = guard();
+        let c = cfg();
+        let node = empty_root();
+        insert(&node, 50, &500, &c, &g);
+        let (val, result) = get_or_insert(&node, 50, &999, &c, &g);
+        assert_eq!(result, InsertResult::Updated);
+        assert_eq!(*val, 500); // original value, not 999
+        assert_eq!(node.total_keys(&g), 1);
+    }
+
+    #[test]
+    fn get_or_insert_conflict_creates_child() {
+        let g = guard();
+        let c = cfg();
+        let pairs: Vec<(u64, &str)> = vec![(10, "a"), (20, "b")];
+        let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
+        let initial_keys = node.total_keys(&g);
+
+        let (val, result) = get_or_insert(&node, 15, &"c", &c, &g);
+        assert_eq!(result, InsertResult::Inserted);
+        assert_eq!(*val, "c");
+        assert_eq!(node.total_keys(&g), initial_keys + 1);
+
+        // All keys still findable
+        assert_eq!(crate::lookup::get(&node, &10, &g), Some(&"a"));
+        assert_eq!(crate::lookup::get(&node, &15, &g), Some(&"c"));
+        assert_eq!(crate::lookup::get(&node, &20, &g), Some(&"b"));
+    }
+
+    #[test]
+    fn get_or_insert_idempotent() {
+        let g = guard();
+        let c = cfg();
+        let node = empty_root();
+        let (v1, r1) = get_or_insert(&node, 42, &100, &c, &g);
+        let (v2, r2) = get_or_insert(&node, 42, &999, &c, &g);
+        assert_eq!(r1, InsertResult::Inserted);
+        assert_eq!(r2, InsertResult::Updated);
+        assert_eq!(*v1, 100);
+        assert_eq!(*v2, 100); // same value as first call
+        assert_eq!(node.total_keys(&g), 1);
+    }
+
+    #[test]
+    fn get_or_insert_many_sequential() {
+        let g = guard();
+        let c = cfg();
+        let node = empty_root();
+        for i in 0..100u64 {
+            let (val, result) = get_or_insert(&node, i, &i, &c, &g);
+            assert_eq!(result, InsertResult::Inserted);
+            assert_eq!(*val, i);
+        }
+        assert_eq!(node.total_keys(&g), 100);
+        for i in 0..100u64 {
+            let (val, result) = get_or_insert(&node, i, &(i + 1000), &c, &g);
+            assert_eq!(result, InsertResult::Updated);
+            assert_eq!(*val, i); // original value
         }
     }
 

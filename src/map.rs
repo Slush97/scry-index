@@ -84,6 +84,20 @@ impl<K: Key, V: Clone + Send + Sync> MapRef<'_, K, V> {
         self.map.remove(key, &self.guard)
     }
 
+    /// Atomically get an existing value or insert a new one.
+    ///
+    /// See [`LearnedMap::get_or_insert`] for details.
+    pub fn get_or_insert(&self, key: K, value: V) -> &V {
+        self.map.get_or_insert(key, value, &self.guard)
+    }
+
+    /// Atomically get an existing value or insert a computed one.
+    ///
+    /// See [`LearnedMap::get_or_insert_with`] for details.
+    pub fn get_or_insert_with(&self, key: K, f: impl FnOnce() -> V) -> &V {
+        self.map.get_or_insert_with(key, f, &self.guard)
+    }
+
     /// Check whether the map contains a key.
     pub fn contains_key(&self, key: &K) -> bool {
         self.map.contains_key(key, &self.guard)
@@ -422,6 +436,68 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             self.len.fetch_sub(1, Ordering::Relaxed);
         }
         removed
+    }
+
+    /// Atomically get an existing value or insert a new one.
+    ///
+    /// If the key already exists, returns a reference to the existing value
+    /// without modifying it. If the key is absent, inserts the key-value pair
+    /// and returns a reference to the newly inserted value.
+    ///
+    /// This is atomic with respect to concurrent operations — there is no
+    /// TOCTOU race between checking and inserting.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn get_or_insert<'g>(&self, key: K, value: V, guard: &'g Guard) -> &'g V {
+        let mut was_new = false;
+        loop {
+            let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+            if root_shared.tag() != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            // SAFETY: root is always non-null.
+            let root = unsafe { root_shared.deref() };
+            let (val, result) = insert::get_or_insert(
+                root,
+                key.clone(),
+                &value,
+                &self.config,
+                &guard.inner,
+            );
+            // Validate: root wasn't replaced or frozen by a concurrent rebuild.
+            if self.root.load(Ordering::Acquire, &guard.inner) != root_shared {
+                if result == InsertResult::Inserted {
+                    was_new = true;
+                }
+                continue;
+            }
+            let is_new = result == InsertResult::Inserted || was_new;
+            if is_new {
+                let new_len = self.len.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+                self.maybe_rebuild_root(new_len, guard);
+            }
+            return val;
+        }
+    }
+
+    /// Atomically get an existing value or insert a computed one.
+    ///
+    /// Like [`get_or_insert`](Self::get_or_insert), but the value is lazily
+    /// computed by `f` only if the key is absent. If the key is present, `f`
+    /// is never called.
+    pub fn get_or_insert_with<'g>(
+        &self,
+        key: K,
+        f: impl FnOnce() -> V,
+        guard: &'g Guard,
+    ) -> &'g V {
+        // Fast path: key already exists.
+        if let Some(val) = self.get(&key, guard) {
+            return val;
+        }
+        // Slow path: compute value and atomically insert-or-get.
+        let value = f();
+        self.get_or_insert(key, value, guard)
     }
 
     /// Check whether the map contains a key.
