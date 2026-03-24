@@ -19,8 +19,9 @@ use crate::node::Node;
 use crate::remove;
 
 /// Number of entries at which the first automatic root rebuild triggers.
-/// 64 entries gives FMCD enough data points for a good model fit.
-const INITIAL_ROOT_REBUILD_THRESHOLD: usize = 64;
+/// 16 entries is enough for FMCD to fit a good model while keeping the
+/// bad-model ramp-up phase brief (O(16^2) vs O(64^2) with the old value).
+const INITIAL_ROOT_REBUILD_THRESHOLD: usize = 16;
 
 /// Growth factor between successive root rebuild thresholds.
 /// Schedule: 64, 128, 256, 512, 1024, 2048, ...
@@ -190,7 +191,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
 
     /// Create a new empty learned map with the given configuration.
     pub fn with_config(config: Config) -> Self {
-        let root = Node::with_capacity(LinearModel::new(0.01, 0.0), 16);
+        let root = Node::with_capacity(LinearModel::new(1.0, 0.0), 64);
         let root_atomic = Atomic::new(root);
         Self {
             root: root_atomic,

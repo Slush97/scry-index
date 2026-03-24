@@ -124,8 +124,33 @@ fn bench_insert_into_bulkloaded(c: &mut Criterion) {
     });
 }
 
+fn bench_insert_learned_100_seq(c: &mut Criterion) {
+    c.bench_function("learned_insert_100_seq_rampup", |b| {
+        b.iter(|| {
+            let map = LearnedMap::new();
+            let guard = map.guard();
+            for i in 0..100u64 {
+                black_box(map.insert(i, i, &guard));
+            }
+        });
+    });
+}
+
+fn bench_insert_btree_100_seq(c: &mut Criterion) {
+    c.bench_function("btree_insert_100_seq_rampup", |b| {
+        b.iter(|| {
+            let mut map = BTreeMap::new();
+            for i in 0..100u64 {
+                black_box(map.insert(i, i));
+            }
+        });
+    });
+}
+
 criterion_group!(
     benches,
+    bench_insert_learned_100_seq,
+    bench_insert_btree_100_seq,
     bench_insert_learned_10k,
     bench_insert_learned_10k_no_rebuild,
     bench_insert_btree_10k,
