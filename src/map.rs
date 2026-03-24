@@ -223,7 +223,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         // historical data, then stream new entries.
         let build_config = Config {
             range_headroom: config.range_headroom.max(1.0),
-            ..config.clone()
+            ..config
         };
         let root = build::bulk_load(pairs, &build_config)?;
         let root_atomic = Atomic::new(root);
@@ -323,7 +323,12 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         let next_threshold = threshold.saturating_mul(ROOT_REBUILD_GROWTH_FACTOR);
         if self
             .next_root_rebuild
-            .compare_exchange(threshold, next_threshold, Ordering::AcqRel, Ordering::Relaxed)
+            .compare_exchange(
+                threshold,
+                next_threshold,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
             self.rebuild(guard);
@@ -827,10 +832,7 @@ mod tests {
             map.insert(i, i, &g);
         }
         let depth = map.max_depth(&g);
-        assert!(
-            depth > 5,
-            "depth {depth} too low without auto rebuild"
-        );
+        assert!(depth > 5, "depth {depth} too low without auto rebuild");
     }
 
     #[test]

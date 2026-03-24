@@ -150,7 +150,10 @@ mod tests {
     fn exact_ordinal_injective_near_precision_boundary() {
         // u64 keys near 2^53 where f64 loses precision
         let base: u64 = 1 << 53;
-        assert_eq!(base as f64, (base + 1) as f64, "precondition: same f64");
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(base as f64, (base + 1) as f64, "precondition: same f64");
+        }
         let o1 = base.to_exact_ordinal();
         let o2 = (base + 1).to_exact_ordinal();
         assert_ne!(o1, o2, "to_exact_ordinal must be injective");
