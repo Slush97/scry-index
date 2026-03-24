@@ -1111,3 +1111,113 @@ fn concurrent_get_or_insert_mixed_ops() {
         );
     }
 }
+
+/// Removes must not be silently lost when a concurrent root rebuild replaces
+/// the tree. Regression test for the write-safety fix in Phase 5c.
+#[test]
+fn rebuild_does_not_resurrect_removed_keys() {
+    let pairs: Vec<(u64, u64)> = (0..1000).map(|i| (i, i)).collect();
+    let map = Arc::new(
+        LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(3));
+
+    // Thread 1: removes even keys
+    let map1 = Arc::clone(&map);
+    let b1 = Arc::clone(&barrier);
+    let h1 = thread::spawn(move || {
+        b1.wait();
+        let guard = map1.guard();
+        for i in (0..1000u64).step_by(2) {
+            map1.remove(&i, &guard);
+        }
+    });
+
+    // Thread 2: triggers rebuilds repeatedly
+    let map2 = Arc::clone(&map);
+    let b2 = Arc::clone(&barrier);
+    let h2 = thread::spawn(move || {
+        b2.wait();
+        for _ in 0..20 {
+            let guard = map2.guard();
+            map2.rebuild(&guard);
+        }
+    });
+
+    // Main thread removes odd keys
+    barrier.wait();
+    {
+        let guard = map.guard();
+        for i in (1..1000u64).step_by(2) {
+            map.remove(&i, &guard);
+        }
+    }
+
+    h1.join().unwrap();
+    h2.join().unwrap();
+
+    // All keys should be removed — none resurrected by rebuild
+    let guard = map.guard();
+    for i in 0..1000u64 {
+        assert!(
+            map.get(&i, &guard).is_none(),
+            "key {i} was resurrected by rebuild"
+        );
+    }
+    assert_eq!(map.iter_sorted(&guard).len(), 0);
+}
+
+/// Removes must not be lost during localized subtree rebuilds triggered by
+/// deep chains or tombstone compaction.
+#[test]
+fn localized_rebuild_does_not_resurrect_removed_keys() {
+    let config = Config::new()
+        .auto_rebuild(true)
+        .rebuild_depth_threshold(3)
+        .tombstone_ratio_threshold(0.2);
+    let map = Arc::new(LearnedMap::with_config(config));
+    let barrier = Arc::new(Barrier::new(3));
+
+    // Thread 1: inserts keys to create deep chains
+    let map1 = Arc::clone(&map);
+    let b1 = Arc::clone(&barrier);
+    let h1 = thread::spawn(move || {
+        b1.wait();
+        let guard = map1.guard();
+        for i in 0..2000u64 {
+            map1.insert(i, i, &guard);
+        }
+    });
+
+    // Thread 2: removes keys as fast as they appear
+    let map2 = Arc::clone(&map);
+    let b2 = Arc::clone(&barrier);
+    let h2 = thread::spawn(move || {
+        b2.wait();
+        let guard = map2.guard();
+        for _ in 0..5 {
+            for i in 0..2000u64 {
+                map2.remove(&i, &guard);
+            }
+        }
+    });
+
+    barrier.wait();
+    h1.join().unwrap();
+    h2.join().unwrap();
+
+    // Final exhaustive remove pass
+    {
+        let guard = map.guard();
+        for i in 0..2000u64 {
+            map.remove(&i, &guard);
+        }
+    }
+
+    let guard = map.guard();
+    assert_eq!(
+        map.iter_sorted(&guard).len(),
+        0,
+        "keys remain after exhaustive remove"
+    );
+}

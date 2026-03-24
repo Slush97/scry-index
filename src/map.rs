@@ -427,15 +427,36 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     }
 
     /// Remove a key. Returns `true` if the key was present and removed.
+    ///
+    /// If a concurrent root rebuild replaces the tree, the remove detects the
+    /// change and retries against the new root. A `was_removed` flag tracks
+    /// whether the key was successfully removed across retries so `len` is
+    /// decremented exactly once.
     pub fn remove(&self, key: &K, guard: &Guard) -> bool {
-        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
-        // SAFETY: root is always non-null.
-        let root = unsafe { root_shared.deref() };
-        let removed = remove::remove(root, key, &self.config, &guard.inner);
-        if removed {
-            self.len.fetch_sub(1, Ordering::Relaxed);
+        let mut was_removed = false;
+        loop {
+            let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+            // If root is frozen (tagged), a global rebuild is in progress.
+            if root_shared.tag() != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            // SAFETY: root is always non-null.
+            let root = unsafe { root_shared.deref() };
+            let removed = remove::remove(root, key, &self.config, &guard.inner);
+            // Validate: root wasn't replaced or frozen by a concurrent rebuild.
+            if self.root.load(Ordering::Acquire, &guard.inner) != root_shared {
+                if removed {
+                    was_removed = true;
+                }
+                continue;
+            }
+            let did_remove = removed || was_removed;
+            if did_remove {
+                self.len.fetch_sub(1, Ordering::Relaxed);
+            }
+            return did_remove;
         }
-        removed
     }
 
     /// Atomically get an existing value or insert a new one.

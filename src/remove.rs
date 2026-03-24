@@ -18,75 +18,117 @@ use crate::node::{Node, SlotInner};
 /// When `config.auto_rebuild` is enabled and the tombstone ratio in the node
 /// exceeds `config.tombstone_ratio_threshold`, triggers a localized subtree
 /// rebuild to compact tombstones.
+///
+/// If a concurrent rebuild replaces a subtree on the remove's descent path,
+/// the remove detects the change via a post-CAS validation and retries from
+/// the root of `node`.
 pub fn remove<K: Key, V: Clone + Send + Sync>(
     node: &Node<K, V>,
     key: &K,
     config: &Config,
     guard: &Guard,
 ) -> bool {
-    let mut current_node = node;
-    let mut rebuild_candidate: Option<(&Node<K, V>, usize)> = None;
+    // Track whether any retry iteration successfully CAS'd the key to null.
+    // If so, the key was genuinely removed, even if a later retry finds it
+    // absent (it was excluded from the rebuild snapshot). Persists across retries.
+    let mut was_removed = false;
 
-    loop {
-        let slot_idx = current_node.predict_slot(key);
-        let slot = current_node.slot(slot_idx);
-        let current = slot.load(Ordering::Acquire, guard);
+    // Outer retry loop: if a concurrent rebuild orphans the subtree we
+    // removed from, we restart the remove from the root.
+    'retry: loop {
+        let mut current_node = node;
+        let mut rebuild_candidate: Option<(&Node<K, V>, usize)> = None;
+        // Track the first child descent so we can detect if a concurrent
+        // rebuild replaced the subtree after our remove completed.
+        #[allow(clippy::type_complexity)]
+        let mut descent_snapshot: Option<(
+            &Node<K, V>,
+            usize,
+            Shared<'_, SlotInner<K, V>>,
+        )> = None;
 
-        if current.is_null() {
-            return false;
-        }
+        loop {
+            let slot_idx = current_node.predict_slot(key);
+            let slot = current_node.slot(slot_idx);
+            let current = slot.load(Ordering::Acquire, guard);
 
-        // SAFETY: current is not null and valid for the lifetime of the guard.
-        let inner = unsafe { current.deref() };
+            if current.is_null() {
+                return was_removed;
+            }
 
-        match inner {
-            SlotInner::Data { key: k, .. } => {
-                if k != key {
-                    return false; // different key
-                }
-                // Found: CAS current → null
-                if slot
-                    .compare_exchange(
-                        current,
-                        Shared::null(),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        guard,
-                    )
-                    .is_ok()
-                {
-                    // SAFETY: CAS succeeded; the old Data is unreachable to
-                    // new readers. Defer destruction until all existing guards
-                    // that may have loaded it are dropped.
-                    unsafe {
-                        guard.defer_destroy(current);
+            // SAFETY: current is not null and valid for the lifetime of the guard.
+            let inner = unsafe { current.deref() };
+
+            match inner {
+                SlotInner::Data { key: k, .. } => {
+                    if k != key {
+                        return was_removed;
                     }
-                    current_node.dec_keys();
-                    current_node.inc_tombstones();
-
-                    if config.auto_rebuild
-                        && current_node.tombstone_ratio()
-                            > config.tombstone_ratio_threshold
+                    // Found: CAS current → null
+                    if slot
+                        .compare_exchange(
+                            current,
+                            Shared::null(),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                            guard,
+                        )
+                        .is_ok()
                     {
-                        if let Some((parent, idx)) = rebuild_candidate {
-                            crate::rebuild::try_rebuild_subtree(
-                                parent, idx, config, guard,
-                            );
+                        // SAFETY: CAS succeeded; the old Data is unreachable to
+                        // new readers. Defer destruction until all existing guards
+                        // that may have loaded it are dropped.
+                        unsafe {
+                            guard.defer_destroy(current);
                         }
-                    }
+                        current_node.dec_keys();
+                        current_node.inc_tombstones();
 
-                    return true;
+                        // Validate: if we descended into a child, verify the
+                        // subtree is still reachable. A concurrent rebuild may
+                        // have replaced it, orphaning our remove.
+                        if let Some((parent, pidx, expected)) = descent_snapshot {
+                            if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
+                                was_removed = true;
+                                continue 'retry;
+                            }
+                        }
+
+                        if config.auto_rebuild
+                            && current_node.tombstone_ratio()
+                                > config.tombstone_ratio_threshold
+                        {
+                            if let Some((parent, idx)) = rebuild_candidate {
+                                crate::rebuild::try_rebuild_subtree(
+                                    parent, idx, config, guard,
+                                );
+                            }
+                        }
+
+                        return true;
+                    }
+                    // CAS failed — slot changed, retry
                 }
-                // CAS failed — slot changed, retry
-            }
-            SlotInner::Child(child) => {
-                if rebuild_candidate.is_none() {
-                    rebuild_candidate = Some((current_node, slot_idx));
+                SlotInner::Child(child) => {
+                    // If the slot is tagged, a rebuild is in progress on this
+                    // subtree. Spin until the rebuild completes, then re-predict
+                    // (the slot now points to the rebuilt child).
+                    if current.tag() != 0 {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    if rebuild_candidate.is_none() {
+                        rebuild_candidate = Some((current_node, slot_idx));
+                    }
+                    // Track first descent for post-remove validation.
+                    if descent_snapshot.is_none() {
+                        descent_snapshot = Some((current_node, slot_idx, current));
+                    }
+                    current_node = child;
                 }
-                current_node = child;
             }
         }
-    }
+    } // 'retry
 }
 
 #[cfg(test)]

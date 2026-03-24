@@ -79,9 +79,11 @@ src/
     `clear()` (done) / `drain()` (done). `bulk_load_dedup`
     variant that deduplicates instead of rejecting duplicates (done). `len()`
     approximation documented on all four callsites (done).
-  - **5c — Durability & operational readiness**: Rebuild-under-concurrency must
-    not silently drop writes — add a retry-on-CAS-failure mode or document the
-    write-quiescence requirement. Tombstone compaction for remove-heavy workloads
+  - **5c — Durability & operational readiness**: Rebuild-under-concurrency write
+    safety (done — `remove` now has frozen-slot spin-wait, `descent_snapshot`
+    validation with retry loop, and root freeze check matching `insert`'s
+    existing protections; removes can no longer be silently lost during
+    concurrent root or localized subtree rebuilds). Tombstone compaction for remove-heavy workloads
     (done — per-node `num_tombstones` counter, configurable
     `tombstone_ratio_threshold` (default 0.5), piggybacks on localized subtree
     rebuild). Memory estimation API `allocated_bytes()` (done). Optional `serde`
