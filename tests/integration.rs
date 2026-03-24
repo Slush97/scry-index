@@ -854,3 +854,145 @@ fn incremental_insert_1000_from_empty() {
         assert_eq!(map.get(&i, &g2), Some(&i), "key {i} missing");
     }
 }
+
+// ---------------------------------------------------------------------------
+// [u8; N] byte array keys
+// ---------------------------------------------------------------------------
+
+#[test]
+fn byte4_insert_get_roundtrip() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    let keys: Vec<[u8; 4]> = (0..100u32).map(|i| i.to_be_bytes()).collect();
+    for (i, k) in keys.iter().enumerate() {
+        map.insert(*k, i, &g);
+    }
+    assert_eq!(map.len(), 100);
+    for (i, k) in keys.iter().enumerate() {
+        assert_eq!(map.get(k, &g), Some(&i), "missing key {k:?}");
+    }
+}
+
+#[test]
+fn byte8_bulk_load_and_lookup() {
+    let pairs: Vec<([u8; 8], u64)> = (0..200u64)
+        .map(|i| (i.to_be_bytes(), i * 10))
+        .collect();
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+    assert_eq!(map.len(), 200);
+    for (k, v) in &pairs {
+        assert_eq!(map.get(k, &g), Some(v), "missing key {k:?}");
+    }
+}
+
+#[test]
+fn byte16_iteration_sorted() {
+    let mut keys: Vec<[u8; 16]> = (0..50u128)
+        .map(|i| i.to_be_bytes())
+        .collect();
+    keys.sort();
+    let pairs: Vec<([u8; 16], usize)> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+    let sorted = map.iter_sorted(&g);
+    assert_eq!(sorted.len(), 50);
+    for w in sorted.windows(2) {
+        assert!(w[0].0 < w[1].0, "not sorted: {:?} >= {:?}", w[0].0, w[1].0);
+    }
+}
+
+#[test]
+fn byte32_insert_remove_cycle() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    let keys: Vec<[u8; 32]> = (0..50u8).map(|i| {
+        let mut k = [0u8; 32];
+        k[0] = i;
+        k
+    }).collect();
+    for (i, k) in keys.iter().enumerate() {
+        map.insert(*k, i, &g);
+    }
+    assert_eq!(map.len(), 50);
+    // Remove odds
+    for (i, k) in keys.iter().enumerate() {
+        if i % 2 != 0 {
+            assert!(map.remove(k, &g));
+        }
+    }
+    assert_eq!(map.len(), 25);
+    // Evens still present
+    for (i, k) in keys.iter().enumerate() {
+        if i % 2 == 0 {
+            assert_eq!(map.get(k, &g), Some(&i));
+        } else {
+            assert_eq!(map.get(k, &g), None);
+        }
+    }
+}
+
+#[test]
+fn byte8_range_query() {
+    let pairs: Vec<([u8; 8], u64)> = (0..100u64)
+        .map(|i| (i.to_be_bytes(), i))
+        .collect();
+    let map = LearnedMap::bulk_load(&pairs).unwrap();
+    let g = map.guard();
+    let lo = 10u64.to_be_bytes();
+    let hi = 20u64.to_be_bytes();
+    let range_keys: Vec<[u8; 8]> = map.range(lo..hi, &g).map(|(k, _)| *k).collect();
+    assert_eq!(range_keys.len(), 10);
+    for k in &range_keys {
+        let val = u64::from_be_bytes(*k);
+        assert!((10..20).contains(&val), "key {val} out of range");
+    }
+}
+
+#[test]
+fn byte4_rebuild_preserves_data() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    for i in 0..100u32 {
+        map.insert(i.to_be_bytes(), i, &g);
+    }
+    map.rebuild(&g);
+    let g2 = map.guard();
+    assert_eq!(map.len(), 100);
+    for i in 0..100u32 {
+        assert_eq!(
+            map.get(&i.to_be_bytes(), &g2),
+            Some(&i),
+            "key {i} lost after rebuild"
+        );
+    }
+}
+
+#[test]
+fn byte16_bulk_load_dedup() {
+    // Duplicate keys — last value wins
+    let mut pairs: Vec<([u8; 16], &str)> = Vec::new();
+    let k1 = [0u8; 16];
+    let k2 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    pairs.push((k1, "first"));
+    pairs.push((k1, "second")); // duplicate
+    pairs.push((k2, "third"));
+    let map = LearnedMap::bulk_load_dedup(&pairs).unwrap();
+    let g = map.guard();
+    assert_eq!(map.len(), 2);
+    assert_eq!(map.get(&k1, &g), Some(&"second"));
+    assert_eq!(map.get(&k2, &g), Some(&"third"));
+}
+
+#[test]
+fn byte_array_set_works() {
+    let keys: Vec<[u8; 8]> = (0..50u64).map(|i| i.to_be_bytes()).collect();
+    let set = LearnedSet::bulk_load(&keys).unwrap();
+    let g = set.guard();
+    assert_eq!(set.len(), 50);
+    for k in &keys {
+        assert!(set.contains(k, &g));
+    }
+    let missing = 999u64.to_be_bytes();
+    assert!(!set.contains(&missing, &g));
+}
