@@ -38,6 +38,13 @@ pub struct Node<K, V> {
     /// is rebuilt (fresh node construction). Used to trigger compaction when the
     /// ratio exceeds the configured threshold.
     num_tombstones: AtomicUsize,
+    /// Optional boundary key for `Ord`-based binary splits.
+    ///
+    /// When set, [`predict_slot`](Self::predict_slot) uses `key <= split_key → 0`,
+    /// `key > split_key → last slot` instead of the linear model. This handles
+    /// the degenerate case where `to_exact_ordinal()` is non-injective
+    /// (e.g., variable-length keys sharing a 16-byte prefix).
+    split_key: Option<K>,
 }
 
 impl<K, V> std::fmt::Debug for Node<K, V> {
@@ -47,6 +54,7 @@ impl<K, V> std::fmt::Debug for Node<K, V> {
             .field("capacity", &self.slots.len())
             .field("num_keys", &self.num_keys.load(Ordering::Relaxed))
             .field("num_tombstones", &self.num_tombstones.load(Ordering::Relaxed))
+            .field("has_split_key", &self.split_key.is_some())
             .finish()
     }
 }
@@ -62,12 +70,41 @@ impl<K: Key, V> Node<K, V> {
             slots: slots.into_boxed_slice(),
             num_keys: AtomicUsize::new(0),
             num_tombstones: AtomicUsize::new(0),
+            split_key: None,
+        }
+    }
+
+    /// Create a node that splits keys using `Ord` comparison against `boundary`.
+    ///
+    /// Keys ≤ `boundary` predict to slot 0; keys > `boundary` predict to the
+    /// last slot. Used when `to_exact_ordinal()` cannot distinguish keys that
+    /// need to be separated (e.g., variable-length keys sharing a 16-byte
+    /// prefix).
+    pub fn with_split_key(boundary: K, array_size: usize) -> Self {
+        let slots: Vec<Atomic<SlotInner<K, V>>> = (0..array_size).map(|_| Atomic::null()).collect();
+        Self {
+            model: LinearModel::constant(),
+            slots: slots.into_boxed_slice(),
+            num_keys: AtomicUsize::new(0),
+            num_tombstones: AtomicUsize::new(0),
+            split_key: Some(boundary),
         }
     }
 
     /// Predict the slot index for a key.
+    ///
+    /// When `split_key` is set, uses `Ord` comparison instead of the linear
+    /// model: keys ≤ `split_key` map to slot 0, keys above map to the last
+    /// slot.
     #[inline]
     pub fn predict_slot(&self, key: &K) -> usize {
+        if let Some(ref sk) = self.split_key {
+            return if key <= sk {
+                0
+            } else {
+                self.slots.len().saturating_sub(1)
+            };
+        }
         self.model.predict(key, self.slots.len())
     }
 

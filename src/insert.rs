@@ -382,19 +382,23 @@ fn build_conflict_node<K: Key, V: Clone + Send + Sync>(
     // Use a 4-slot array: map lo to slot 0, hi to slot 3
     let array_size = 4;
 
-    let model = if key_range.abs() < f64::EPSILON {
+    let node = if key_range.abs() < f64::EPSILON {
         // Keys have the same f64 representation (precision loss for large
         // integers). Use exact ordinal comparison to separate them.
         let lo_ord = lo_k.to_exact_ordinal();
         let hi_ord = hi_k.to_exact_ordinal();
-        let midpoint = lo_ord + (hi_ord - lo_ord) / 2;
-        LinearModel::binary_split(midpoint)
+        if lo_ord == hi_ord {
+            // Ordinals also collide (e.g., variable-length keys sharing a
+            // 16-byte prefix). Fall back to Ord-based split.
+            Node::with_split_key(lo_k.clone(), array_size)
+        } else {
+            let midpoint = lo_ord + (hi_ord - lo_ord) / 2;
+            Node::with_capacity(LinearModel::binary_split(midpoint), array_size)
+        }
     } else {
         let s = (array_size - 1) as f64 / key_range;
-        LinearModel::new(s, -s * lo_f)
+        Node::with_capacity(LinearModel::new(s, -s * lo_f), array_size)
     };
-
-    let node = Node::with_capacity(model, array_size);
 
     let s1 = node.predict_slot(&lo_k);
     let s2 = node.predict_slot(&hi_k);

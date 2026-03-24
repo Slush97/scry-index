@@ -101,6 +101,36 @@ impl Key for i128 {
     }
 }
 
+/// Interpret the first 8 bytes of a byte slice as a big-endian `u64` → `f64`.
+///
+/// Shorter slices are zero-padded on the right. Provides a monotonic mapping
+/// with respect to lexicographic byte order.
+#[inline]
+fn bytes_to_model_input(bytes: &[u8]) -> f64 {
+    let mut buf = [0u8; 8];
+    let len = bytes.len().min(8);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    u64::from_be_bytes(buf) as f64
+}
+
+/// Interpret the first 16 bytes of a byte slice as a big-endian `u128`,
+/// then apply the sign-flip bijection to produce an order-preserving `i128`.
+///
+/// Shorter slices are zero-padded on the right. For slices longer than 16
+/// bytes, only the first 16 bytes are used — keys that share a 16-byte
+/// prefix will produce the same ordinal (non-injective). The index handles
+/// these collisions via `Ord`-based splits in the node.
+#[inline]
+#[allow(clippy::cast_possible_wrap)]
+fn bytes_to_exact_ordinal(bytes: &[u8]) -> i128 {
+    let mut buf = [0u8; 16];
+    let len = bytes.len().min(16);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    // Order-preserving bijection: XOR with i128::MIN
+    // maps 0x00..00 → i128::MIN and 0xFF..FF → i128::MAX.
+    (u128::from_be_bytes(buf) as i128) ^ i128::MIN
+}
+
 /// Key impl for fixed-size byte arrays.
 ///
 /// Enables byte-array keys like `[u8; 16]` (UUIDs), `[u8; 32]` (hashes), etc.
@@ -111,26 +141,60 @@ impl Key for i128 {
 /// - `to_exact_ordinal`: interprets the first 16 bytes as a big-endian `u128`
 ///   (with the same sign-flip trick as `u128`). This is injective for `N <= 16`.
 ///   For `N > 16`, it is a best-effort prefix — distinct keys that share their
-///   first 16 bytes will collide. The index resolves these via `Ord` comparison
-///   on the full array, but model quality may degrade for such keys.
+///   first 16 bytes will collide. The index resolves these via `Ord`-based
+///   splits in the node.
 impl<const N: usize> Key for [u8; N] {
     #[inline]
     fn to_model_input(&self) -> f64 {
-        let mut buf = [0u8; 8];
-        let len = N.min(8);
-        buf[..len].copy_from_slice(&self[..len]);
-        u64::from_be_bytes(buf) as f64
+        bytes_to_model_input(self)
     }
 
     #[inline]
-    #[allow(clippy::cast_possible_wrap)]
     fn to_exact_ordinal(&self) -> i128 {
-        let mut buf = [0u8; 16];
-        let len = N.min(16);
-        buf[..len].copy_from_slice(&self[..len]);
-        // Same order-preserving bijection as u128: XOR with i128::MIN
-        // maps 0x00..00 → i128::MIN and 0xFF..FF → i128::MAX.
-        (u128::from_be_bytes(buf) as i128) ^ i128::MIN
+        bytes_to_exact_ordinal(self)
+    }
+}
+
+/// Key impl for `String`.
+///
+/// Enables heap-allocated string keys. Uses the UTF-8 byte representation
+/// for model input and ordinal computation.
+///
+/// - `to_model_input`: interprets the first 8 bytes as a big-endian `u64` →
+///   `f64`. Strings shorter than 8 bytes are zero-padded. Monotonic with
+///   respect to lexicographic (byte) order.
+/// - `to_exact_ordinal`: interprets the first 16 bytes as a big-endian `u128`
+///   with sign-flip. Non-injective for strings sharing a 16-byte prefix;
+///   the index uses `Ord`-based node splits to handle these collisions.
+impl Key for String {
+    #[inline]
+    fn to_model_input(&self) -> f64 {
+        bytes_to_model_input(self.as_bytes())
+    }
+
+    #[inline]
+    fn to_exact_ordinal(&self) -> i128 {
+        bytes_to_exact_ordinal(self.as_bytes())
+    }
+}
+
+/// Key impl for `Vec<u8>`.
+///
+/// Enables heap-allocated byte-vector keys. Semantics are identical to the
+/// fixed-size `[u8; N]` implementation but for dynamically sized vectors.
+///
+/// - `to_model_input`: first 8 bytes as big-endian `u64` → `f64`.
+/// - `to_exact_ordinal`: first 16 bytes as `i128` with sign-flip.
+///   Non-injective for vectors sharing a 16-byte prefix.
+impl Key for Vec<u8> {
+    #[inline]
+    fn to_model_input(&self) -> f64 {
+        bytes_to_model_input(self)
+    }
+
+    #[inline]
+    fn to_exact_ordinal(&self) -> i128 {
+        bytes_to_exact_ordinal(self)
     }
 }
 
@@ -317,5 +381,138 @@ mod tests {
         assert_eq!(a.to_exact_ordinal(), b.to_exact_ordinal());
         // But Ord comparison still distinguishes them
         assert!(a < b);
+    }
+
+    // -----------------------------------------------------------------------
+    // String keys
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn string_key_is_send_sync() {
+        fn assert_key<T: Key>() {}
+        assert_key::<String>();
+    }
+
+    #[test]
+    fn string_model_input_monotonic() {
+        let keys: Vec<String> = vec![
+            String::new(),
+            "a".into(),
+            "b".into(),
+            "hello".into(),
+            "world".into(),
+            "zzzzzzzz".into(),
+        ];
+        for pair in keys.windows(2) {
+            assert!(
+                pair[0].to_model_input() <= pair[1].to_model_input(),
+                "monotonicity violated for String: {:?} > {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn string_model_input_finite() {
+        let keys = vec![String::new(), "hello".into(), "\u{ffff}".into()];
+        for k in &keys {
+            let v = k.to_model_input();
+            assert!(v.is_finite(), "{k:?} produced non-finite model input {v}");
+        }
+    }
+
+    #[test]
+    fn string_exact_ordinal_monotonic() {
+        let keys: Vec<String> = vec![
+            String::new(),
+            "a".into(),
+            "aa".into(),
+            "ab".into(),
+            "b".into(),
+        ];
+        for pair in keys.windows(2) {
+            assert!(
+                pair[0].to_exact_ordinal() <= pair[1].to_exact_ordinal(),
+                "exact_ordinal not monotonic for String: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn string_shared_prefix_same_ordinal() {
+        // Strings sharing a 16+ byte prefix have the same ordinal.
+        let a = "1234567890abcdefXXX".to_string();
+        let b = "1234567890abcdefYYY".to_string();
+        assert_eq!(a.to_exact_ordinal(), b.to_exact_ordinal());
+        assert!(a < b);
+    }
+
+    #[test]
+    fn string_different_in_first_16_bytes() {
+        let a = "1234567890abcdeX".to_string();
+        let b = "1234567890abcdeY".to_string();
+        assert!(a.to_exact_ordinal() < b.to_exact_ordinal());
+    }
+
+    #[test]
+    fn string_matches_byte_array() {
+        // String and [u8; N] should produce the same model input/ordinal
+        // for identical byte content.
+        let s = "hello".to_string();
+        let arr: [u8; 5] = *b"hello";
+        assert_eq!(s.to_model_input(), arr.to_model_input());
+        assert_eq!(s.to_exact_ordinal(), arr.to_exact_ordinal());
+    }
+
+    // -----------------------------------------------------------------------
+    // Vec<u8> keys
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vec_u8_key_is_send_sync() {
+        fn assert_key<T: Key>() {}
+        assert_key::<Vec<u8>>();
+    }
+
+    #[test]
+    fn vec_u8_model_input_monotonic() {
+        let keys: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 1],
+            vec![1],
+            vec![1, 0],
+            vec![255],
+        ];
+        for pair in keys.windows(2) {
+            assert!(
+                pair[0].to_model_input() <= pair[1].to_model_input(),
+                "monotonicity violated for Vec<u8>: {:?} > {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn vec_u8_exact_ordinal_monotonic() {
+        let keys: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0],
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
+            vec![1],
+        ];
+        for pair in keys.windows(2) {
+            assert!(
+                pair[0].to_exact_ordinal() <= pair[1].to_exact_ordinal(),
+                "exact_ordinal not monotonic for Vec<u8>: {:?} >= {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

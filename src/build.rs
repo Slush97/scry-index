@@ -155,10 +155,16 @@ fn build_degenerate<K: Key, V: Clone>(pairs: &[(K, V)]) -> Node<K, V> {
 
     let lo_last_ord = lo_half.last().unwrap().0.to_exact_ordinal();
     let hi_first_ord = hi_half.first().unwrap().0.to_exact_ordinal();
-    let midpoint = lo_last_ord + (hi_first_ord - lo_last_ord) / 2;
 
-    let model = LinearModel::binary_split(midpoint);
-    let node = Node::with_capacity(model, 2);
+    let node = if lo_last_ord == hi_first_ord {
+        // Ordinals collide (e.g., variable-length keys sharing a 16-byte
+        // prefix). Fall back to Ord-based split using the boundary key.
+        Node::with_split_key(lo_half.last().unwrap().0.clone(), 2)
+    } else {
+        let midpoint = lo_last_ord + (hi_first_ord - lo_last_ord) / 2;
+        let model = LinearModel::binary_split(midpoint);
+        Node::with_capacity(model, 2)
+    };
 
     if lo_half.len() == 1 {
         node.store_slot(
