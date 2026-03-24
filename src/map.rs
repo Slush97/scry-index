@@ -89,12 +89,17 @@ impl<K: Key, V: Clone + Send + Sync> MapRef<'_, K, V> {
         self.map.contains_key(key, &self.guard)
     }
 
-    /// Return the number of key-value pairs (approximate).
+    /// Return the approximate number of key-value pairs in the map.
+    ///
+    /// See [`LearnedMap::len`] for details on relaxed-atomic staleness
+    /// under concurrency.
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
     /// Return `true` if the map contains no entries.
+    ///
+    /// Subject to the same relaxed-atomic staleness as [`len`](Self::len).
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
@@ -418,13 +423,18 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
 
     /// Return the approximate number of key-value pairs in the map.
     ///
-    /// This is a relaxed atomic load and may be slightly stale under
-    /// concurrent modification.
+    /// Uses a relaxed atomic load internally. Under concurrent inserts or
+    /// removes the returned value may be slightly stale — it is **not**
+    /// linearizable with respect to other operations. For an exact count,
+    /// call [`iter`](Self::iter) and count the entries, which gives a
+    /// consistent snapshot under the epoch guard.
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Relaxed)
     }
 
     /// Return `true` if the map contains no entries.
+    ///
+    /// Subject to the same relaxed-atomic staleness as [`len`](Self::len).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

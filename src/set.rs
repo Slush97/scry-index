@@ -38,12 +38,17 @@ impl<K: Key> SetRef<'_, K> {
         self.inner.contains_key(key)
     }
 
-    /// Return the number of elements (approximate).
+    /// Return the approximate number of elements in the set.
+    ///
+    /// See [`LearnedMap::len`](crate::LearnedMap::len) for details on
+    /// relaxed-atomic staleness under concurrency.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Return `true` if the set is empty.
+    ///
+    /// Subject to the same relaxed-atomic staleness as [`len`](Self::len).
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -118,12 +123,17 @@ impl<K: Key> LearnedSet<K> {
         self.inner.contains_key(key, guard)
     }
 
-    /// Return the number of elements (approximate).
+    /// Return the approximate number of elements in the set.
+    ///
+    /// See [`LearnedMap::len`](crate::LearnedMap::len) for details on
+    /// relaxed-atomic staleness under concurrency.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
     /// Return `true` if the set is empty.
+    ///
+    /// Subject to the same relaxed-atomic staleness as [`len`](Self::len).
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
