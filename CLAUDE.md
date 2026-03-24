@@ -58,13 +58,14 @@ src/
   Phase 2.5 `RwLock` with fully lock-free operation. Global `rebuild()` remains
   as explicit lock-free compaction API.
 - **Phase 5**: Production hardening. Three sub-phases:
-  - **5a — Model & efficiency**: Replace linear-interpolation fitting with true
-    FMCD (candidate slope iteration to minimize conflicts). Adaptive root sizing
-    so insert-from-empty doesn't degrade to 350x slower than BTreeMap (auto-grow
-    the root array based on first N inserts, or require `bulk_load` for optimal
-    init). Per-entry memory overhead audit — current heap alloc per slot via
-    `Atomic<SlotInner>` causes poor cache locality vs BTreeMap's contiguous nodes;
-    explore arena-based slot storage. Add `size_hint` to iterators.
+  - **5a — Model & efficiency (done, except arena audit)**: True FMCD candidate
+    slope iteration (done). Adaptive root sizing — lowered initial rebuild
+    threshold to 16 and improved initial root to 64 slots/slope=1.0; ramp-up
+    went from ~350x to ~5x vs BTreeMap (done). `size_hint` on `Iter` with
+    count hint from `LearnedMap::len()` (done). Per-entry memory overhead
+    audit — current heap alloc per slot via `Atomic<SlotInner>` causes poor
+    cache locality vs BTreeMap's contiguous nodes; explore arena-based slot
+    storage (remaining).
   - **5b — Key generalization & API gaps**: Relax `Key: Copy` to support
     `[u8; N]`, fixed-size byte arrays, and eventually `AsRef<[u8]>` key types.
     This is the single biggest blocker for real-world adoption (no strings, UUIDs,

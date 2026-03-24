@@ -139,6 +139,11 @@ impl<K: Key, V: Clone + Send + Sync> MapRef<'_, K, V> {
     pub fn rebuild(&self) {
         self.map.rebuild(&self.guard);
     }
+
+    /// Remove all entries from the map.
+    pub fn clear(&self) {
+        self.map.clear(&self.guard);
+    }
 }
 
 /// A sorted key-value map backed by a learned index.
@@ -533,6 +538,64 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             );
         }
     }
+
+    /// Remove all entries from the map, resetting it to an empty state.
+    ///
+    /// Uses the same freeze protocol as [`rebuild`](Self::rebuild) to coordinate
+    /// with concurrent inserts. After clearing, the map has a fresh root identical
+    /// to one created by [`new`](Self::new).
+    pub fn clear(&self, guard: &Guard) {
+        let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
+        if root_shared.is_null() || root_shared.tag() != 0 {
+            return;
+        }
+
+        // Freeze the root so concurrent inserts spin-wait.
+        let frozen = root_shared.with_tag(1);
+        if self
+            .root
+            .compare_exchange(
+                root_shared,
+                frozen,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                &guard.inner,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        let new_root = Node::with_capacity(LinearModel::new(1.0, 0.0), 64);
+        let new_owned = Owned::new(new_root);
+        if self
+            .root
+            .compare_exchange(
+                frozen,
+                new_owned,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                &guard.inner,
+            )
+            .is_ok()
+        {
+            // SAFETY: CAS succeeded; old root is unreachable to new readers.
+            unsafe {
+                guard.inner.defer_destroy(root_shared);
+            }
+            self.len.store(0, Ordering::Relaxed);
+            self.next_root_rebuild
+                .store(INITIAL_ROOT_REBUILD_THRESHOLD, Ordering::Relaxed);
+        } else {
+            let _ = self.root.compare_exchange(
+                frozen,
+                root_shared,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+                &guard.inner,
+            );
+        }
+    }
 }
 
 impl<K: Key, V: Clone + Send + Sync> Default for LearnedMap<K, V> {
@@ -862,5 +925,59 @@ mod tests {
         for i in 0..150u64 {
             assert_eq!(map.get(&i, &g2), Some(&i));
         }
+    }
+
+    #[test]
+    fn clear_empties_map() {
+        let map = LearnedMap::new();
+        let g = map.guard();
+        for i in 0..100u64 {
+            map.insert(i, i, &g);
+        }
+        assert_eq!(map.len(), 100);
+        map.clear(&g);
+        let g2 = map.guard();
+        assert_eq!(map.len(), 0);
+        assert!(map.is_empty());
+        for i in 0..100u64 {
+            assert_eq!(map.get(&i, &g2), None);
+        }
+    }
+
+    #[test]
+    fn clear_then_reinsert() {
+        let map = LearnedMap::new();
+        let g = map.guard();
+        for i in 0..50u64 {
+            map.insert(i, i * 10, &g);
+        }
+        map.clear(&g);
+        let g2 = map.guard();
+        for i in 0..30u64 {
+            map.insert(i + 100, i, &g2);
+        }
+        assert_eq!(map.len(), 30);
+        assert_eq!(map.get(&100, &g2), Some(&0));
+        assert_eq!(map.get(&0, &g2), None);
+    }
+
+    #[test]
+    fn clear_empty_is_noop() {
+        let map = LearnedMap::<u64, u64>::new();
+        let g = map.guard();
+        map.clear(&g);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn map_ref_clear() {
+        let map = LearnedMap::new();
+        let m = map.pin();
+        m.insert(1u64, "a");
+        m.insert(2, "b");
+        assert_eq!(m.len(), 2);
+        m.clear();
+        assert!(m.is_empty());
+        assert_eq!(m.get(&1), None);
     }
 }
