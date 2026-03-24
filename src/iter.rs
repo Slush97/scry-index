@@ -20,6 +20,8 @@ pub struct Iter<'g, K, V> {
     stack: Vec<(&'g Node<K, V>, usize)>,
     /// The epoch guard that keeps referenced data alive.
     guard: &'g Guard,
+    /// Approximate remaining entries, used for `size_hint`.
+    remaining: Option<usize>,
 }
 
 impl<'g, K: Key, V> Iter<'g, K, V> {
@@ -28,6 +30,19 @@ impl<'g, K: Key, V> Iter<'g, K, V> {
         Self {
             stack: vec![(root, 0)],
             guard,
+            remaining: None,
+        }
+    }
+
+    /// Create a new iterator with an approximate entry count hint.
+    ///
+    /// The hint is used by [`size_hint`](Iterator::size_hint) to help
+    /// callers like `collect()` pre-allocate. It does not need to be exact.
+    pub fn with_hint(root: &'g Node<K, V>, guard: &'g Guard, count: usize) -> Self {
+        Self {
+            stack: vec![(root, 0)],
+            guard,
+            remaining: Some(count),
         }
     }
 }
@@ -55,12 +70,21 @@ impl<'g, K: Key, V> Iterator for Iter<'g, K, V> {
 
             // SAFETY: shared is not null and valid for the lifetime of the guard.
             match unsafe { shared.deref() } {
-                SlotInner::Data { key, value } => return Some((key, value)),
+                SlotInner::Data { key, value } => {
+                    if let Some(r) = &mut self.remaining {
+                        *r = r.saturating_sub(1);
+                    }
+                    return Some((key, value));
+                }
                 SlotInner::Child(child) => {
                     self.stack.push((child, 0));
                 }
             }
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.remaining.map_or((0, None), |r| (r, Some(r)))
     }
 }
 
@@ -471,5 +495,25 @@ mod tests {
         let g = guard();
         let node = Node::<u64, u64>::with_capacity(crate::model::LinearModel::constant(), 5);
         assert!(last_entry(&node, &g).is_none());
+    }
+
+    #[test]
+    fn size_hint_without_hint() {
+        let g = guard();
+        let pairs: Vec<(u64, u64)> = (0..10).map(|i| (i, i)).collect();
+        let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
+        let iter = Iter::new(&node, &g);
+        assert_eq!(iter.size_hint(), (0, None));
+    }
+
+    #[test]
+    fn size_hint_with_hint() {
+        let g = guard();
+        let pairs: Vec<(u64, u64)> = (0..10).map(|i| (i, i)).collect();
+        let node = crate::build::bulk_load(&pairs, &Config::default()).unwrap();
+        let mut iter = Iter::with_hint(&node, &g, 10);
+        assert_eq!(iter.size_hint(), (10, Some(10)));
+        iter.next();
+        assert_eq!(iter.size_hint(), (9, Some(9)));
     }
 }

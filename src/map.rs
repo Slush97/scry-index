@@ -373,7 +373,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
         let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
         // SAFETY: root is always non-null.
         let root = unsafe { root_shared.deref() };
-        Iter::new(root, &guard.inner)
+        Iter::with_hint(root, &guard.inner, self.len())
     }
 
     /// Collect all key-value pairs in sorted order (cloned).
