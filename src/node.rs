@@ -17,6 +17,7 @@
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 
@@ -65,7 +66,9 @@ pub struct Node<K, V> {
     /// Inline value storage. Valid when state is DATA, CHILD_STALE, or TOMBSTONE.
     values: Box<[UnsafeCell<MaybeUninit<V>>]>,
     /// Child node pointers. Valid when state is CHILD or CHILD_STALE.
-    children: Box<[Atomic<Node<K, V>>]>,
+    /// Lazily initialized via [`OnceLock`] to avoid allocating a large array
+    /// for zero-conflict bulk-loaded nodes that never need children.
+    children: OnceLock<Box<[Atomic<Node<K, V>>]>>,
     /// Approximate number of data entries in this node (not counting children).
     num_keys: AtomicUsize,
     /// Approximate number of tombstones in this node.
@@ -89,17 +92,50 @@ impl<K, V> std::fmt::Debug for Node<K, V> {
 impl<K: Key, V> Node<K, V> {
     /// Create a new node with the given model and array size.
     ///
-    /// All slots are initialized to empty.
+    /// All slots are initialized to empty. A full children array is allocated
+    /// eagerly for conflict resolution. Use [`with_capacity_leaf`] when no
+    /// conflicts are expected (e.g., zero-conflict bulk-load nodes) to defer
+    /// the children allocation until a child is actually stored.
     pub fn with_capacity(model: LinearModel, array_size: usize) -> Self {
         // Use a single zeroed allocation for states, keys, and values.
         // MaybeUninit and AtomicU8(0) are both zero-initialized, so we can
         // use vec![...; n] which the compiler can lower to calloc/memset.
+        let children = OnceLock::new();
+        // Eagerly initialize the children array for nodes that expect conflicts.
+        let _ = children.set(
+            (0..array_size)
+                .map(|_| Atomic::null())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
         Self {
             model,
             states: (0..array_size).map(|_| AtomicU8::new(SLOT_EMPTY)).collect::<Vec<_>>().into_boxed_slice(),
             keys: (0..array_size).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect::<Vec<_>>().into_boxed_slice(),
             values: (0..array_size).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect::<Vec<_>>().into_boxed_slice(),
-            children: (0..array_size).map(|_| Atomic::null()).collect::<Vec<_>>().into_boxed_slice(),
+            children,
+            num_keys: AtomicUsize::new(0),
+            num_tombstones: AtomicUsize::new(0),
+            split_key: None,
+        }
+    }
+
+    /// Create a leaf node with the given model and array size.
+    ///
+    /// Like [`with_capacity`] but defers the children array allocation until
+    /// a child is actually stored. This saves one heap allocation of
+    /// `array_size * size_of::<Atomic<Node>>()` bytes, which is significant
+    /// for large zero-conflict bulk-loaded nodes.
+    ///
+    /// If a concurrent insert later creates a conflict on this node, the
+    /// children array is lazily allocated via [`OnceLock`] on first use.
+    pub fn with_capacity_leaf(model: LinearModel, array_size: usize) -> Self {
+        Self {
+            model,
+            states: (0..array_size).map(|_| AtomicU8::new(SLOT_EMPTY)).collect::<Vec<_>>().into_boxed_slice(),
+            keys: (0..array_size).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect::<Vec<_>>().into_boxed_slice(),
+            values: (0..array_size).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect::<Vec<_>>().into_boxed_slice(),
+            children: OnceLock::new(),
             num_keys: AtomicUsize::new(0),
             num_tombstones: AtomicUsize::new(0),
             split_key: None,
@@ -136,6 +172,26 @@ impl<K: Key, V> Node<K, V> {
     }
 
     // -----------------------------------------------------------------------
+    // Children array lazy initialization
+    // -----------------------------------------------------------------------
+
+    /// Lazily initialize and return the children array.
+    ///
+    /// On the first call, allocates an array of `capacity()` null [`Atomic`]
+    /// pointers. Subsequent calls return the same array. Thread-safe via
+    /// [`OnceLock`].
+    #[inline]
+    fn ensure_children(&self) -> &[Atomic<Node<K, V>>] {
+        self.children.get_or_init(|| {
+            let cap = self.states.len();
+            (0..cap)
+                .map(|_| Atomic::null())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // Construction-time writes (no concurrent access)
     // -----------------------------------------------------------------------
 
@@ -157,16 +213,18 @@ impl<K: Key, V> Node<K, V> {
 
     /// Store a child node during construction.
     ///
-    /// The slot must be empty. No inline data is written.
+    /// The slot must be empty. No inline data is written. Lazily allocates
+    /// the children array if this is the first child stored.
     pub fn store_child(&self, idx: usize, child: Node<K, V>) {
         debug_assert_eq!(
             self.states[idx].load(Ordering::Relaxed),
             SLOT_EMPTY,
             "store_child called on non-empty slot {idx}"
         );
+        let children = self.ensure_children();
         unsafe {
             let guard = epoch::unprotected();
-            self.children[idx].store(Owned::new(child).into_shared(guard), Ordering::Relaxed);
+            children[idx].store(Owned::new(child).into_shared(guard), Ordering::Relaxed);
         }
         self.states[idx].store(SLOT_CHILD, Ordering::Relaxed);
     }
@@ -204,19 +262,27 @@ impl<K: Key, V> Node<K, V> {
     }
 
     /// Load the child pointer at the given slot.
+    ///
+    /// Returns `Shared::null()` if the children array has not been initialized
+    /// (e.g., for a leaf node created via [`with_capacity_leaf`]).
     #[inline]
     pub fn load_child<'g>(
         &self,
         idx: usize,
         guard: &'g Guard,
     ) -> crossbeam_epoch::Shared<'g, Node<K, V>> {
-        self.children[idx].load(Ordering::Acquire, guard)
+        match self.children.get() {
+            Some(children) => children[idx].load(Ordering::Acquire, guard),
+            None => crossbeam_epoch::Shared::null(),
+        }
     }
 
     /// Get a reference to the child's [`Atomic`] for CAS operations (freeze, etc.).
+    ///
+    /// Lazily allocates the children array if it has not been initialized.
     #[inline]
     pub fn child_atomic(&self, idx: usize) -> &Atomic<Node<K, V>> {
-        &self.children[idx]
+        &self.ensure_children()[idx]
     }
 
     /// Get a reference to the state [`AtomicU8`] for CAS operations.
@@ -295,8 +361,8 @@ impl<K: Key, V> Node<K, V> {
         {
             return false;
         }
-        // We own the slot. Store the child pointer.
-        self.children[idx].store(Owned::new(child).into_shared(guard), Ordering::Release);
+        // We own the slot. Store the child pointer (lazily allocates children array).
+        self.ensure_children()[idx].store(Owned::new(child).into_shared(guard), Ordering::Release);
         // Publish: the inline data is now stale but stays for drop correctness.
         self.states[idx].store(SLOT_CHILD_STALE, Ordering::Release);
         true
@@ -346,16 +412,19 @@ impl<K: Key, V> Node<K, V> {
 
     /// Count total keys stored in this node and all descendants.
     pub fn total_keys(&self, guard: &Guard) -> usize {
+        let children = self.children.get();
         let mut count = 0;
         for i in 0..self.states.len() {
             let state = self.states[i].load(Ordering::Acquire);
             match state {
                 SLOT_DATA => count += 1,
                 s if is_child(s) => {
-                    let child_shared = self.children[i].load(Ordering::Acquire, guard);
-                    if !child_shared.is_null() {
-                        // SAFETY: child_shared is valid for the guard lifetime.
-                        count += unsafe { child_shared.deref() }.total_keys(guard);
+                    if let Some(c) = children {
+                        let child_shared = c[i].load(Ordering::Acquire, guard);
+                        if !child_shared.is_null() {
+                            // SAFETY: child_shared is valid for the guard lifetime.
+                            count += unsafe { child_shared.deref() }.total_keys(guard);
+                        }
                     }
                 }
                 _ => {}
@@ -368,21 +437,25 @@ impl<K: Key, V> Node<K, V> {
     pub fn allocated_bytes(&self, guard: &Guard) -> usize {
         let node_size = std::mem::size_of::<Self>();
         let cap = self.states.len();
+        let children = self.children.get();
+        let children_cap = children.map_or(0, |c| c.len());
         let arrays_size = cap
             * (std::mem::size_of::<AtomicU8>()
                 + std::mem::size_of::<UnsafeCell<MaybeUninit<K>>>()
-                + std::mem::size_of::<UnsafeCell<MaybeUninit<V>>>()
-                + std::mem::size_of::<Atomic<Node<K, V>>>());
+                + std::mem::size_of::<UnsafeCell<MaybeUninit<V>>>())
+            + children_cap * std::mem::size_of::<Atomic<Self>>();
 
         let mut total = node_size + arrays_size;
 
-        for i in 0..cap {
-            let state = self.states[i].load(Ordering::Acquire);
-            if is_child(state) {
-                let child_shared = self.children[i].load(Ordering::Acquire, guard);
-                if !child_shared.is_null() {
-                    // SAFETY: child_shared is valid for the guard lifetime.
-                    total += unsafe { child_shared.deref() }.allocated_bytes(guard);
+        if let Some(c) = children {
+            for i in 0..cap {
+                let state = self.states[i].load(Ordering::Acquire);
+                if is_child(state) {
+                    let child_shared = c[i].load(Ordering::Acquire, guard);
+                    if !child_shared.is_null() {
+                        // SAFETY: child_shared is valid for the guard lifetime.
+                        total += unsafe { child_shared.deref() }.allocated_bytes(guard);
+                    }
                 }
             }
         }
@@ -393,14 +466,16 @@ impl<K: Key, V> Node<K, V> {
     /// Return the depth of the deepest path from this node.
     pub fn max_depth(&self, guard: &Guard) -> usize {
         let mut max_child_depth = 0;
-        for i in 0..self.states.len() {
-            let state = self.states[i].load(Ordering::Acquire);
-            if is_child(state) {
-                let child_shared = self.children[i].load(Ordering::Acquire, guard);
-                if !child_shared.is_null() {
-                    // SAFETY: child_shared is valid for the guard lifetime.
-                    let depth = unsafe { child_shared.deref() }.max_depth(guard);
-                    max_child_depth = max_child_depth.max(depth);
+        if let Some(children) = self.children.get() {
+            for i in 0..self.states.len() {
+                let state = self.states[i].load(Ordering::Acquire);
+                if is_child(state) {
+                    let child_shared = children[i].load(Ordering::Acquire, guard);
+                    if !child_shared.is_null() {
+                        // SAFETY: child_shared is valid for the guard lifetime.
+                        let depth = unsafe { child_shared.deref() }.max_depth(guard);
+                        max_child_depth = max_child_depth.max(depth);
+                    }
                 }
             }
         }
@@ -414,6 +489,7 @@ impl<K, V> Drop for Node<K, V> {
         // reference this node.
         unsafe {
             let guard = epoch::unprotected();
+            let children = self.children.get();
             for i in 0..self.states.len() {
                 let state = *self.states[i].get_mut();
                 // Drop inline data if it was initialized.
@@ -427,10 +503,12 @@ impl<K, V> Drop for Node<K, V> {
                     std::ptr::drop_in_place((*self.values[i].get()).as_mut_ptr());
                 }
                 // Drop child node if present.
-                if is_child(state) {
-                    let shared = self.children[i].load(Ordering::Relaxed, guard);
-                    if !shared.is_null() {
-                        drop(shared.into_owned());
+                if let Some(c) = children {
+                    if is_child(state) {
+                        let shared = c[i].load(Ordering::Relaxed, guard);
+                        if !shared.is_null() {
+                            drop(shared.into_owned());
+                        }
                     }
                 }
             }

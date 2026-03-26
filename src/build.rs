@@ -52,51 +52,53 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
         config.range_headroom,
     );
 
-    let node = Node::with_capacity(result.model, result.array_size);
-
     if result.conflicts == 0 {
-        // No conflicts — place each key-value directly in its predicted slot.
+        // No conflicts — use a leaf node (no children array allocation).
+        let node = Node::with_capacity_leaf(result.model, result.array_size);
         for (key, value) in pairs {
             let slot = node.predict_slot(key);
             node.store_data(slot, key.clone(), value.clone());
             node.inc_keys();
         }
-    } else {
-        // Conflicts exist — sort by predicted slot, then process runs.
-        let mut assignments: Vec<(usize, usize)> = pairs
-            .iter()
-            .enumerate()
-            .map(|(i, (k, _))| (node.predict_slot(k), i))
-            .collect();
-        assignments.sort_unstable_by_key(|&(slot, _)| slot);
+        return node;
+    }
 
-        let mut i = 0;
-        while i < assignments.len() {
-            let slot_idx = assignments[i].0;
-            let start = i;
-            while i < assignments.len() && assignments[i].0 == slot_idx {
-                i += 1;
-            }
-            let run = &assignments[start..i];
-            if run.len() == 1 {
-                let (k, v) = &pairs[run[0].1];
-                node.store_data(slot_idx, k.clone(), v.clone());
-                node.inc_keys();
+    // Conflicts exist — sort by predicted slot, then process runs.
+    let node = Node::with_capacity(result.model, result.array_size);
+
+    let mut assignments: Vec<(usize, usize)> = pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (k, _))| (node.predict_slot(k), i))
+        .collect();
+    assignments.sort_unstable_by_key(|&(slot, _)| slot);
+
+    let mut i = 0;
+    while i < assignments.len() {
+        let slot_idx = assignments[i].0;
+        let start = i;
+        while i < assignments.len() && assignments[i].0 == slot_idx {
+            i += 1;
+        }
+        let run = &assignments[start..i];
+        if run.len() == 1 {
+            let (k, v) = &pairs[run[0].1];
+            node.store_data(slot_idx, k.clone(), v.clone());
+            node.inc_keys();
+        } else {
+            let child_pairs: Vec<(K, V)> = run
+                .iter()
+                .map(|&(_, idx)| {
+                    let (k, v) = &pairs[idx];
+                    (k.clone(), v.clone())
+                })
+                .collect();
+            let child = if is_degenerate_group(&child_pairs) {
+                build_degenerate(&child_pairs)
             } else {
-                let child_pairs: Vec<(K, V)> = run
-                    .iter()
-                    .map(|&(_, idx)| {
-                        let (k, v) = &pairs[idx];
-                        (k.clone(), v.clone())
-                    })
-                    .collect();
-                let child = if is_degenerate_group(&child_pairs) {
-                    build_degenerate(&child_pairs)
-                } else {
-                    build_recursive(&child_pairs, config)
-                };
-                node.store_child(slot_idx, child);
-            }
+                build_recursive(&child_pairs, config)
+            };
+            node.store_child(slot_idx, child);
         }
     }
 

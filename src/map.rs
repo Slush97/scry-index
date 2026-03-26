@@ -19,9 +19,11 @@ use crate::node::Node;
 use crate::remove;
 
 /// Number of entries at which the first automatic root rebuild triggers.
-/// 16 entries is enough for FMCD to fit a good model while keeping the
-/// bad-model ramp-up phase brief (O(16^2) vs O(64^2) with the old value).
-const INITIAL_ROOT_REBUILD_THRESHOLD: usize = 16;
+/// 64 entries gives FMCD enough data points for a well-fitted model,
+/// reducing the number of rebuilds during the critical ramp-up phase
+/// (first ~1000 inserts). The slightly longer initial bad-model phase
+/// is offset by fewer total rebuilds and better model quality.
+const INITIAL_ROOT_REBUILD_THRESHOLD: usize = 64;
 
 /// Growth factor between successive root rebuild thresholds.
 /// Schedule: 64, 128, 256, 512, 1024, 2048, ...
