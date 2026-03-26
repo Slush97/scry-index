@@ -2,12 +2,11 @@
 #![allow(unsafe_code)]
 
 use std::ops::{Bound, RangeBounds};
-use std::sync::atomic::Ordering;
 
 use crossbeam_epoch::Guard;
 
 use crate::key::Key;
-use crate::node::{Node, SlotInner};
+use crate::node::{is_child, Node, SLOT_DATA};
 
 /// An iterator over the key-value pairs in a learned index in sorted order.
 ///
@@ -53,32 +52,32 @@ impl<'g, K: Key, V> Iterator for Iter<'g, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let (node, slot_idx) = self.stack.last_mut()?;
-
             if *slot_idx >= node.capacity() {
-                // Exhausted this node, pop and continue parent
                 self.stack.pop();
                 continue;
             }
-
             let current_idx = *slot_idx;
             *slot_idx += 1;
 
-            let shared = node.slot(current_idx).load(Ordering::Acquire, self.guard);
-            if shared.is_null() {
-                continue;
-            }
-
-            // SAFETY: shared is not null and valid for the lifetime of the guard.
-            match unsafe { shared.deref() } {
-                SlotInner::Data { key, value } => {
+            let state = node.slot_state(current_idx);
+            match state {
+                SLOT_DATA => {
                     if let Some(r) = &mut self.remaining {
                         *r = r.saturating_sub(1);
                     }
+                    // SAFETY: state is DATA, inline data is valid.
+                    let key = unsafe { node.read_key(current_idx) };
+                    let value = unsafe { node.read_value(current_idx) };
                     return Some((key, value));
                 }
-                SlotInner::Child(child) => {
-                    self.stack.push((child, 0));
+                s if is_child(s) => {
+                    let child_shared = node.load_child(current_idx, self.guard);
+                    if !child_shared.is_null() {
+                        let child = unsafe { child_shared.deref() };
+                        self.stack.push((child, 0));
+                    }
                 }
+                _ => continue, // EMPTY, WRITING, TOMBSTONE
             }
         }
     }
@@ -162,10 +161,11 @@ impl<'g, K: Key, V> Range<'g, K, V> {
     /// parent at `slot + 1` and recurses into the child.
     fn seek_to(&mut self, node: &'g Node<K, V>, key: &K) {
         let p = node.predict_slot(key);
-        let shared = node.slot(p).load(Ordering::Acquire, self.guard);
-        if !shared.is_null() {
-            // SAFETY: shared is not null and valid for the lifetime of the guard.
-            if let SlotInner::Child(child) = unsafe { shared.deref() } {
+        let state = node.slot_state(p);
+        if is_child(state) {
+            let child_shared = node.load_child(p, self.guard);
+            if !child_shared.is_null() {
+                let child = unsafe { child_shared.deref() };
                 self.stack.push((node, p + 1));
                 self.seek_to(child, key);
                 return;
@@ -212,14 +212,12 @@ impl<'g, K: Key, V> Iterator for Range<'g, K, V> {
             let current_idx = *slot_idx;
             *slot_idx += 1;
 
-            let shared = node.slot(current_idx).load(Ordering::Acquire, self.guard);
-            if shared.is_null() {
-                continue;
-            }
-
-            // SAFETY: shared is not null and valid for the lifetime of the guard.
-            match unsafe { shared.deref() } {
-                SlotInner::Data { key, value } => {
+            let state = node.slot_state(current_idx);
+            match state {
+                SLOT_DATA => {
+                    // SAFETY: state is DATA, inline data is valid.
+                    let key = unsafe { node.read_key(current_idx) };
+                    let value = unsafe { node.read_value(current_idx) };
                     if self.past_end(key) {
                         self.done = true;
                         return None;
@@ -232,9 +230,14 @@ impl<'g, K: Key, V> Iterator for Range<'g, K, V> {
                     }
                     return Some((key, value));
                 }
-                SlotInner::Child(child) => {
-                    self.stack.push((child, 0));
+                s if is_child(s) => {
+                    let child_shared = node.load_child(current_idx, self.guard);
+                    if !child_shared.is_null() {
+                        let child = unsafe { child_shared.deref() };
+                        self.stack.push((child, 0));
+                    }
                 }
+                _ => continue, // EMPTY, WRITING, TOMBSTONE
             }
         }
     }
@@ -259,17 +262,22 @@ pub fn last_entry<'g, K: Key, V>(root: &'g Node<K, V>, guard: &'g Guard) -> Opti
     loop {
         let mut child_found = None;
         for i in (0..node.capacity()).rev() {
-            let shared = node.slot(i).load(Ordering::Acquire, guard);
-            if shared.is_null() {
-                continue;
-            }
-            // SAFETY: shared is not null and valid for the lifetime of the guard.
-            match unsafe { shared.deref() } {
-                SlotInner::Data { key, value } => return Some((key, value)),
-                SlotInner::Child(child) => {
-                    child_found = Some(child);
-                    break;
+            let state = node.slot_state(i);
+            match state {
+                SLOT_DATA => {
+                    // SAFETY: state is DATA, inline data is valid.
+                    let key = unsafe { node.read_key(i) };
+                    let value = unsafe { node.read_value(i) };
+                    return Some((key, value));
                 }
+                s if is_child(s) => {
+                    let child_shared = node.load_child(i, guard);
+                    if !child_shared.is_null() {
+                        child_found = Some(unsafe { child_shared.deref() });
+                        break;
+                    }
+                }
+                _ => continue,
             }
         }
         node = child_found?;

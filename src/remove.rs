@@ -1,17 +1,15 @@
 //! Lock-free remove algorithm with CAS retry loop and tombstone compaction.
 //!
-//! When a key is removed, the slot is CAS'd to null (a "tombstone"). If the
-//! tombstone ratio in the node exceeds the configured threshold, a localized
-//! rebuild of the parent subtree is triggered to reclaim space.
+//! When a key is removed, the slot state is CAS'd from `DATA` to `TOMBSTONE`.
+//! If the tombstone ratio in the node exceeds the configured threshold, a
+//! localized rebuild of the parent subtree is triggered to reclaim space.
 #![allow(unsafe_code)]
-
-use std::sync::atomic::Ordering;
 
 use crossbeam_epoch::{Guard, Shared};
 
 use crate::config::Config;
 use crate::key::Key;
-use crate::node::{Node, SlotInner};
+use crate::node::{is_child, Node, SLOT_DATA, SLOT_EMPTY, SLOT_TOMBSTONE, SLOT_WRITING};
 
 /// Remove a key from the tree, returning `true` if it was found and removed.
 ///
@@ -28,7 +26,7 @@ pub fn remove<K: Key, V: Clone + Send + Sync>(
     config: &Config,
     guard: &Guard,
 ) -> bool {
-    // Track whether any retry iteration successfully CAS'd the key to null.
+    // Track whether any retry iteration successfully CAS'd the key to tombstone.
     // If so, the key was genuinely removed, even if a later retry finds it
     // absent (it was excluded from the rebuild snapshot). Persists across retries.
     let mut was_removed = false;
@@ -44,43 +42,27 @@ pub fn remove<K: Key, V: Clone + Send + Sync>(
         let mut descent_snapshot: Option<(
             &Node<K, V>,
             usize,
-            Shared<'_, SlotInner<K, V>>,
+            Shared<'_, Node<K, V>>,
         )> = None;
 
         loop {
             let slot_idx = current_node.predict_slot(key);
-            let slot = current_node.slot(slot_idx);
-            let current = slot.load(Ordering::Acquire, guard);
+            let state = current_node.slot_state(slot_idx);
 
-            if current.is_null() {
-                return was_removed;
-            }
-
-            // SAFETY: current is not null and valid for the lifetime of the guard.
-            let inner = unsafe { current.deref() };
-
-            match inner {
-                SlotInner::Data { key: k, .. } => {
+            match state {
+                SLOT_EMPTY | SLOT_TOMBSTONE => return was_removed,
+                SLOT_WRITING => {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                SLOT_DATA => {
+                    // SAFETY: state is DATA, so the key slot is initialized.
+                    let k = unsafe { current_node.read_key(slot_idx) };
                     if k != key {
                         return was_removed;
                     }
-                    // Found: CAS current → null
-                    if slot
-                        .compare_exchange(
-                            current,
-                            Shared::null(),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                            guard,
-                        )
-                        .is_ok()
-                    {
-                        // SAFETY: CAS succeeded; the old Data is unreachable to
-                        // new readers. Defer destruction until all existing guards
-                        // that may have loaded it are dropped.
-                        unsafe {
-                            guard.defer_destroy(current);
-                        }
+                    // Found: CAS DATA -> TOMBSTONE
+                    if current_node.cas_data_to_tombstone(slot_idx) {
                         current_node.dec_keys();
                         current_node.inc_tombstones();
 
@@ -88,12 +70,14 @@ pub fn remove<K: Key, V: Clone + Send + Sync>(
                         // subtree is still reachable. A concurrent rebuild may
                         // have replaced it, orphaning our remove.
                         if let Some((parent, pidx, expected)) = descent_snapshot {
-                            if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
+                            if parent.load_child(pidx, guard) != expected {
                                 was_removed = true;
                                 continue 'retry;
                             }
                         }
 
+                        // Tombstone compaction: if the ratio exceeds threshold,
+                        // trigger a localized subtree rebuild.
                         if config.auto_rebuild
                             && current_node.tombstone_ratio()
                                 > config.tombstone_ratio_threshold
@@ -107,25 +91,32 @@ pub fn remove<K: Key, V: Clone + Send + Sync>(
 
                         return true;
                     }
-                    // CAS failed — slot changed, retry
+                    // CAS failed -- slot changed, retry inner loop
                 }
-                SlotInner::Child(child) => {
+                s if is_child(s) => {
+                    let child_shared = current_node.load_child(slot_idx, guard);
                     // If the slot is tagged, a rebuild is in progress on this
                     // subtree. Spin until the rebuild completes, then re-predict
                     // (the slot now points to the rebuilt child).
-                    if current.tag() != 0 {
+                    if child_shared.tag() != 0 {
                         std::hint::spin_loop();
                         continue;
+                    }
+                    if child_shared.is_null() {
+                        return was_removed;
                     }
                     if rebuild_candidate.is_none() {
                         rebuild_candidate = Some((current_node, slot_idx));
                     }
                     // Track first descent for post-remove validation.
                     if descent_snapshot.is_none() {
-                        descent_snapshot = Some((current_node, slot_idx, current));
+                        descent_snapshot = Some((current_node, slot_idx, child_shared));
                     }
-                    current_node = child;
+                    // SAFETY: child_shared is not null and valid for the
+                    // lifetime of the guard.
+                    current_node = unsafe { child_shared.deref() };
                 }
+                _ => return was_removed, // unknown state
             }
         }
     } // 'retry
@@ -135,6 +126,7 @@ pub fn remove<K: Key, V: Clone + Send + Sync>(
 mod tests {
     use super::*;
     use crate::insert;
+    use crate::node::Node;
 
     use crossbeam_epoch as epoch;
 
@@ -229,7 +221,7 @@ mod tests {
     fn tombstone_compaction_preserves_remaining_keys() {
         let g = guard();
         let c = Config::new().auto_rebuild(true).tombstone_ratio_threshold(0.3);
-        let root = crate::node::Node::<u64, u64>::with_capacity(
+        let root = Node::<u64, u64>::with_capacity(
             crate::model::LinearModel::new(0.01, 0.0),
             16,
         );
@@ -239,7 +231,7 @@ mod tests {
         }
         assert_eq!(root.total_keys(&g), 40);
 
-        // Remove most keys — should trigger tombstone compaction
+        // Remove most keys -- should trigger tombstone compaction
         for i in 0..30u64 {
             remove(&root, &i, &c, &g);
         }

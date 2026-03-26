@@ -1,21 +1,23 @@
 //! Lock-free insert algorithm using LIPP's chain method with CAS retry loops.
 //!
 //! When inserting a key into a node:
-//! - If the predicted slot is empty, CAS null → Data.
-//! - If the slot contains the same key, CAS old → new Data (update).
-//! - If the slot contains a different key, build a child and CAS old → Child.
-//! - If the slot contains a child, recurse into it.
-//! - On CAS failure, retry from the slot load.
+//! - If the predicted slot is empty, CAS `EMPTY` → `WRITING` → `DATA` (inline).
+//! - If the slot contains the same key (`DATA`), build a 1-entry child with the
+//!   new value and CAS `DATA` → `CHILD_STALE`. The old inline data stays stale.
+//! - If the slot contains a different key (`DATA`), clone the existing key+value,
+//!   build a 2-entry conflict child, and CAS `DATA` → `CHILD_STALE`.
+//! - If the slot is `CHILD` or `CHILD_STALE`, follow the child pointer.
+//! - If the slot is `TOMBSTONE`, CAS `TOMBSTONE` → `WRITING` → `DATA` to reuse it.
+//! - If the slot is `WRITING`, spin (another thread is claiming it).
+//! - On CAS failure, retry from the slot state read.
 #![allow(unsafe_code)]
 
-use std::sync::atomic::Ordering;
-
-use crossbeam_epoch::{self as epoch, Guard, Owned, Shared};
+use crossbeam_epoch::{self as epoch, Guard, Shared};
 
 use crate::config::Config;
 use crate::key::Key;
 use crate::model::LinearModel;
-use crate::node::{Node, SlotInner};
+use crate::node::{is_child, Node, SLOT_DATA, SLOT_TOMBSTONE, SLOT_WRITING};
 
 /// Result of an insert operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,35 +61,33 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
         let mut rebuild_candidate: Option<(&Node<K, V>, usize)> = None;
         // Track the first child descent so we can detect if a concurrent
         // rebuild replaced the subtree after our insert completed.
+        // Tuple: (parent_node, slot_idx, child_shared).
         #[allow(clippy::type_complexity)]
         let mut descent_snapshot: Option<(
             &Node<K, V>,
             usize,
-            Shared<'_, SlotInner<K, V>>,
+            Shared<'_, Node<K, V>>,
         )> = None;
 
         loop {
             let slot_idx = current_node.predict_slot(&key);
-            let slot = current_node.slot(slot_idx);
+            let state = current_node.slot_state(slot_idx);
 
-            let current = slot.load(Ordering::Acquire, guard);
+            if state == SLOT_WRITING {
+                // Another thread is claiming this slot. Spin and re-read.
+                std::hint::spin_loop();
+                continue;
+            }
 
-            if current.is_null() {
-                // Empty slot: CAS null → Data
-                let new = Owned::new(SlotInner::Data {
-                    key: key.clone(),
-                    value: value.clone(),
-                });
-                if slot
-                    .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire, guard)
-                    .is_ok()
-                {
+            if state == crate::node::SLOT_EMPTY {
+                // Empty slot: CAS EMPTY → WRITING → DATA (inline).
+                if current_node.cas_empty_to_data(slot_idx, key.clone(), value.clone()) {
                     current_node.inc_keys();
                     // Validate: if we descended into a child, verify the subtree
                     // is still reachable. A concurrent rebuild may have replaced
                     // it, orphaning our insert.
                     if let Some((parent, pidx, expected)) = descent_snapshot {
-                        if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
+                        if parent.load_child(pidx, guard) != expected {
                             retry_was_new = true;
                             continue 'retry;
                         }
@@ -102,104 +102,117 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                     }
                     return InsertResult::Inserted;
                 }
+                // CAS failed — slot changed, retry from state read.
                 continue;
             }
 
-            // SAFETY: current is not null and valid for the lifetime of the guard.
-            let inner = unsafe { current.deref() };
-
-            match inner {
-                SlotInner::Data {
-                    key: existing_key,
-                    value: existing_value,
-                } => {
-                    if existing_key == &key {
-                        // Same key: CAS old Data → new Data (update)
-                        let new = Owned::new(SlotInner::Data {
-                            key: key.clone(),
-                            value: value.clone(),
-                        });
-                        if slot
-                            .compare_exchange(
-                                current,
-                                new,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                                guard,
-                            )
-                            .is_ok()
-                        {
-                            // SAFETY: We successfully CAS'd out `current`. No new reader
-                            // will load it. Existing readers are protected by their guards.
-                            unsafe {
-                                guard.defer_destroy(current);
-                            }
-                            if let Some((parent, pidx, expected)) = descent_snapshot {
-                                if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
-                                    continue 'retry;
-                                }
-                            }
-                            return if retry_was_new {
-                                InsertResult::Inserted
-                            } else {
-                                InsertResult::Updated
-                            };
+            if state == SLOT_TOMBSTONE {
+                // Reuse a tombstone slot.
+                if current_node.cas_tombstone_to_data(slot_idx, key.clone(), value.clone()) {
+                    current_node.inc_keys();
+                    if let Some((parent, pidx, expected)) = descent_snapshot {
+                        if parent.load_child(pidx, guard) != expected {
+                            retry_was_new = true;
+                            continue 'retry;
                         }
-                        // CAS failed — slot changed, retry
-                        continue;
                     }
-                    // Collision: build child containing both entries, CAS old → Child
-                    let ek = existing_key.clone();
-                    let ev = existing_value.clone();
-                    let child = build_conflict_node(ek, ev, key.clone(), value.clone(), config);
-                    let new = Owned::new(SlotInner::Child(child));
-                    if slot
-                        .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire, guard)
-                        .is_ok()
-                    {
-                        // SAFETY: CAS succeeded; old Data is unreachable to new readers.
-                        unsafe {
-                            guard.defer_destroy(current);
+                    if config.auto_rebuild && depth > config.rebuild_depth_threshold {
+                        if let Some((parent, idx)) = rebuild_candidate {
+                            crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
                         }
-                        current_node.dec_keys(); // existing data moved to child
+                    }
+                    return InsertResult::Inserted;
+                }
+                // CAS failed — slot changed, retry.
+                continue;
+            }
+
+            if state == SLOT_DATA {
+                // SAFETY: state is DATA so inline key is valid and immutable.
+                let existing_key = unsafe { current_node.read_key(slot_idx) };
+
+                if existing_key == &key {
+                    // Same key: build a single-entry child with the new value,
+                    // then CAS DATA → CHILD_STALE. The old inline data stays stale.
+                    let child = build_single_entry_child(&key, value.clone());
+                    if current_node.cas_data_to_child_stale(slot_idx, child, guard) {
                         if let Some((parent, pidx, expected)) = descent_snapshot {
-                            if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
-                                retry_was_new = true;
+                            if parent.load_child(pidx, guard) != expected {
                                 continue 'retry;
                             }
                         }
-                        if config.auto_rebuild && depth > config.rebuild_depth_threshold {
-                            if let Some((parent, idx)) = rebuild_candidate {
-                                crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
-                            }
+                        return if retry_was_new {
+                            InsertResult::Inserted
+                        } else {
+                            InsertResult::Updated
+                        };
+                    }
+                    // CAS failed — slot changed, retry.
+                    continue;
+                }
+
+                // Collision: clone the existing key+value and build a 2-entry
+                // conflict child node.
+                let ek = existing_key.clone();
+                // SAFETY: state is DATA so inline value is valid and immutable.
+                let ev = unsafe { current_node.read_value(slot_idx) }.clone();
+                let child = build_conflict_node(ek, ev, key.clone(), value.clone(), config);
+
+                if current_node.cas_data_to_child_stale(slot_idx, child, guard) {
+                    current_node.dec_keys(); // existing data moved to child
+                    if let Some((parent, pidx, expected)) = descent_snapshot {
+                        if parent.load_child(pidx, guard) != expected {
+                            retry_was_new = true;
+                            continue 'retry;
                         }
-                        return InsertResult::Inserted;
                     }
-                    // CAS failed — slot changed, retry
+                    if config.auto_rebuild && depth > config.rebuild_depth_threshold {
+                        if let Some((parent, idx)) = rebuild_candidate {
+                            crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
+                        }
+                    }
+                    return InsertResult::Inserted;
                 }
-                SlotInner::Child(child) => {
-                    // If the slot is tagged, a rebuild is in progress on this
-                    // subtree. Spin until the rebuild completes, then re-predict
-                    // (the slot now points to the rebuilt child).
-                    if current.tag() != 0 {
-                        std::hint::spin_loop();
-                        continue;
-                    }
-                    depth += 1;
-                    // Capture the shallowest child on the descent path. If depth
-                    // eventually exceeds the threshold, we rebuild from this point,
-                    // flattening the entire degraded chain — not just a small
-                    // subtree deep in the tree.
-                    if rebuild_candidate.is_none() {
-                        rebuild_candidate = Some((current_node, slot_idx));
-                    }
-                    // Track first descent for post-insert validation.
-                    if descent_snapshot.is_none() {
-                        descent_snapshot = Some((current_node, slot_idx, current));
-                    }
-                    current_node = child;
-                }
+                // CAS failed — slot changed, retry.
+                continue;
             }
+
+            if is_child(state) {
+                // CHILD or CHILD_STALE: follow the child pointer.
+                let child_shared = current_node.load_child(slot_idx, guard);
+
+                // If the child pointer is tagged, a rebuild is in progress on this
+                // subtree. Spin until the rebuild completes, then re-predict
+                // (the slot now points to the rebuilt child).
+                if child_shared.tag() != 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+
+                if child_shared.is_null() {
+                    // Should not happen for a CHILD/CHILD_STALE slot, but be safe.
+                    continue;
+                }
+
+                depth += 1;
+                // Capture the shallowest child on the descent path. If depth
+                // eventually exceeds the threshold, we rebuild from this point,
+                // flattening the entire degraded chain — not just a small
+                // subtree deep in the tree.
+                if rebuild_candidate.is_none() {
+                    rebuild_candidate = Some((current_node, slot_idx));
+                }
+                // Track first descent for post-insert validation.
+                if descent_snapshot.is_none() {
+                    descent_snapshot = Some((current_node, slot_idx, child_shared));
+                }
+                // SAFETY: child_shared is not null and valid for the guard lifetime.
+                current_node = unsafe { child_shared.deref() };
+                continue;
+            }
+
+            // Unknown state — spin and re-read (defensive).
+            std::hint::spin_loop();
         }
     } // 'retry
 }
@@ -216,7 +229,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
 /// The returned reference is valid for the lifetime of the `guard`.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
-    node: &Node<K, V>,
+    node: &'g Node<K, V>,
     key: K,
     value: &V,
     config: &Config,
@@ -225,136 +238,166 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
     let mut retry_was_new = false;
 
     'retry: loop {
-        let mut current_node = node;
+        let mut current_node: &'g Node<K, V> = node;
         let mut depth: usize = 0;
-        let mut rebuild_candidate: Option<(&Node<K, V>, usize)> = None;
+        let mut rebuild_candidate: Option<(&'g Node<K, V>, usize)> = None;
         #[allow(clippy::type_complexity)]
         let mut descent_snapshot: Option<(
-            &Node<K, V>,
+            &'g Node<K, V>,
             usize,
-            Shared<'_, SlotInner<K, V>>,
+            Shared<'g, Node<K, V>>,
         )> = None;
 
         loop {
             let slot_idx = current_node.predict_slot(&key);
-            let slot = current_node.slot(slot_idx);
+            let state = current_node.slot_state(slot_idx);
 
-            let current = slot.load(Ordering::Acquire, guard);
-
-            if current.is_null() {
-                // Empty slot: CAS null → Data
-                let new = Owned::new(SlotInner::Data {
-                    key: key.clone(),
-                    value: value.clone(),
-                });
-                match slot.compare_exchange(
-                    current,
-                    new,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                    guard,
-                ) {
-                    Ok(shared) => {
-                        current_node.inc_keys();
-                        if let Some((parent, pidx, expected)) = descent_snapshot {
-                            if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
-                                retry_was_new = true;
-                                continue 'retry;
-                            }
-                        }
-                        if config.auto_rebuild && depth > config.rebuild_depth_threshold {
-                            if let Some((parent, idx)) = rebuild_candidate {
-                                crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
-                            }
-                        }
-                        // SAFETY: shared is the value we just CAS'd in, valid for 'g.
-                        let inner = unsafe { shared.deref() };
-                        if let SlotInner::Data { value: v, .. } = inner {
-                            return (v, InsertResult::Inserted);
-                        }
-                        // Structurally unreachable: we CAS'd a Data variant.
-                        // Fall through to re-read the slot on the next iteration.
-                        continue;
-                    }
-                    Err(_) => continue,
-                }
+            if state == SLOT_WRITING {
+                std::hint::spin_loop();
+                continue;
             }
 
-            // SAFETY: current is not null and valid for the lifetime of the guard.
-            let inner = unsafe { current.deref() };
-
-            match inner {
-                SlotInner::Data {
-                    key: existing_key,
-                    value: existing_value,
-                } => {
-                    if existing_key == &key {
-                        // Same key: return existing value, don't update.
-                        let result = if retry_was_new {
-                            InsertResult::Inserted
-                        } else {
-                            InsertResult::Updated
-                        };
-                        return (existing_value, result);
+            if state == crate::node::SLOT_EMPTY {
+                // Empty slot: CAS EMPTY → WRITING → DATA (inline).
+                if current_node.cas_empty_to_data(slot_idx, key.clone(), value.clone()) {
+                    current_node.inc_keys();
+                    if let Some((parent, pidx, expected)) = descent_snapshot {
+                        if parent.load_child(pidx, guard) != expected {
+                            retry_was_new = true;
+                            continue 'retry;
+                        }
                     }
-                    // Collision: build child containing both entries, CAS old → Child
-                    let ek = existing_key.clone();
-                    let ev = existing_value.clone();
-                    let child = build_conflict_node(ek, ev, key.clone(), value.clone(), config);
-                    let new = Owned::new(SlotInner::Child(child));
-                    if let Ok(shared) = slot.compare_exchange(
-                        current,
-                        new,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        guard,
-                    ) {
-                        // SAFETY: CAS succeeded; old Data is unreachable to new readers.
-                        unsafe {
-                            guard.defer_destroy(current);
+                    if config.auto_rebuild && depth > config.rebuild_depth_threshold {
+                        if let Some((parent, idx)) = rebuild_candidate {
+                            crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
                         }
-                        current_node.dec_keys(); // existing data moved to child
-                        if let Some((parent, pidx, expected)) = descent_snapshot {
-                            if parent.slot(pidx).load(Ordering::Acquire, guard) != expected {
-                                retry_was_new = true;
-                                continue 'retry;
-                            }
-                        }
-                        if config.auto_rebuild && depth > config.rebuild_depth_threshold {
-                            if let Some((parent, idx)) = rebuild_candidate {
-                                crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
-                            }
-                        }
-                        // Look up the value we just inserted in the new child.
-                        // SAFETY: shared is the Child we just CAS'd in, valid for 'g.
-                        let child_inner = unsafe { shared.deref() };
-                        if let SlotInner::Child(child_node) = child_inner {
-                            if let Some(val) =
-                                crate::lookup::get(child_node, &key, guard)
-                            {
-                                return (val, InsertResult::Inserted);
-                            }
-                        }
-                        // Should not happen by construction; loop retries.
                     }
+                    // SAFETY: We just wrote the value via cas_empty_to_data and
+                    // the state is now DATA. The inline value is valid for 'g.
+                    let val = unsafe { current_node.read_value(slot_idx) };
+                    return (val, InsertResult::Inserted);
                 }
-                SlotInner::Child(child) => {
-                    if current.tag() != 0 {
-                        std::hint::spin_loop();
-                        continue;
-                    }
-                    depth += 1;
-                    if rebuild_candidate.is_none() {
-                        rebuild_candidate = Some((current_node, slot_idx));
-                    }
-                    if descent_snapshot.is_none() {
-                        descent_snapshot = Some((current_node, slot_idx, current));
-                    }
-                    current_node = child;
-                }
+                // CAS failed — slot changed, retry.
+                continue;
             }
+
+            if state == SLOT_TOMBSTONE {
+                // Reuse a tombstone slot.
+                if current_node.cas_tombstone_to_data(slot_idx, key.clone(), value.clone()) {
+                    current_node.inc_keys();
+                    if let Some((parent, pidx, expected)) = descent_snapshot {
+                        if parent.load_child(pidx, guard) != expected {
+                            retry_was_new = true;
+                            continue 'retry;
+                        }
+                    }
+                    if config.auto_rebuild && depth > config.rebuild_depth_threshold {
+                        if let Some((parent, idx)) = rebuild_candidate {
+                            crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
+                        }
+                    }
+                    // SAFETY: We just wrote the value. State is DATA.
+                    let val = unsafe { current_node.read_value(slot_idx) };
+                    return (val, InsertResult::Inserted);
+                }
+                // CAS failed — slot changed, retry.
+                continue;
+            }
+
+            if state == SLOT_DATA {
+                // SAFETY: state is DATA so inline key+value are valid.
+                let existing_key = unsafe { current_node.read_key(slot_idx) };
+
+                if existing_key == &key {
+                    // Same key: return existing value, don't update.
+                    // SAFETY: state is DATA so inline value is valid and immutable.
+                    let existing_value = unsafe { current_node.read_value(slot_idx) };
+                    let result = if retry_was_new {
+                        InsertResult::Inserted
+                    } else {
+                        InsertResult::Updated
+                    };
+                    return (existing_value, result);
+                }
+
+                // Collision: clone the existing key+value, build a 2-entry
+                // conflict child.
+                let ek = existing_key.clone();
+                let ev = unsafe { current_node.read_value(slot_idx) }.clone();
+                let child = build_conflict_node(ek, ev, key.clone(), value.clone(), config);
+
+                if current_node.cas_data_to_child_stale(slot_idx, child, guard) {
+                    current_node.dec_keys(); // existing data moved to child
+                    if let Some((parent, pidx, expected)) = descent_snapshot {
+                        if parent.load_child(pidx, guard) != expected {
+                            retry_was_new = true;
+                            continue 'retry;
+                        }
+                    }
+                    if config.auto_rebuild && depth > config.rebuild_depth_threshold {
+                        if let Some((parent, idx)) = rebuild_candidate {
+                            crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
+                        }
+                    }
+                    // Look up the value we just inserted in the new child.
+                    let child_shared = current_node.load_child(slot_idx, guard);
+                    if !child_shared.is_null() {
+                        // SAFETY: child_shared is the child we just stored.
+                        let child_node = unsafe { child_shared.deref() };
+                        if let Some(val) = crate::lookup::get(child_node, &key, guard) {
+                            return (val, InsertResult::Inserted);
+                        }
+                    }
+                    // Should not happen by construction; loop retries.
+                }
+                // CAS failed — slot changed, retry.
+                continue;
+            }
+
+            if is_child(state) {
+                let child_shared = current_node.load_child(slot_idx, guard);
+
+                if child_shared.tag() != 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+
+                if child_shared.is_null() {
+                    continue;
+                }
+
+                depth += 1;
+                if rebuild_candidate.is_none() {
+                    rebuild_candidate = Some((current_node, slot_idx));
+                }
+                if descent_snapshot.is_none() {
+                    descent_snapshot = Some((current_node, slot_idx, child_shared));
+                }
+                // SAFETY: child_shared is not null and valid for guard lifetime.
+                current_node = unsafe { child_shared.deref() };
+                continue;
+            }
+
+            // Unknown state — spin and re-read (defensive).
+            std::hint::spin_loop();
         }
     } // 'retry
+}
+
+/// Build a single-entry child node containing one key-value pair.
+///
+/// Used when updating an existing key: the new value goes into a child node
+/// so the parent slot can be CAS'd from `DATA` → `CHILD_STALE`.
+fn build_single_entry_child<K: Key, V: Clone + Send + Sync>(
+    key: &K,
+    value: V,
+) -> Node<K, V> {
+    let f = key.to_model_input();
+    let node = Node::with_capacity(LinearModel::new(1.0, -f), 2);
+    let slot = node.predict_slot(key);
+    node.store_data(slot, key.clone(), value);
+    node.inc_keys();
+    node
 }
 
 /// Build a small child node from two conflicting key-value pairs.
@@ -403,13 +446,7 @@ fn build_conflict_node<K: Key, V: Clone + Send + Sync>(
     let s1 = node.predict_slot(&lo_k);
     let s2 = node.predict_slot(&hi_k);
 
-    node.store_slot(
-        s1,
-        SlotInner::Data {
-            key: lo_k,
-            value: lo_v,
-        },
-    );
+    node.store_data(s1, lo_k, lo_v);
     node.inc_keys();
 
     if s1 == s2 {
@@ -423,13 +460,7 @@ fn build_conflict_node<K: Key, V: Clone + Send + Sync>(
             insert(&node, hi_k, &hi_v, config, guard);
         }
     } else {
-        node.store_slot(
-            s2,
-            SlotInner::Data {
-                key: hi_k,
-                value: hi_v,
-            },
-        );
+        node.store_data(s2, hi_k, hi_v);
         node.inc_keys();
     }
 

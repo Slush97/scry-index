@@ -1,45 +1,41 @@
 //! Lock-free lookup algorithm for the learned index.
 #![allow(unsafe_code)]
 
-use std::sync::atomic::Ordering;
-
-use crossbeam_epoch::{Guard, Shared};
+use crossbeam_epoch::Guard;
 
 use crate::key::Key;
-use crate::node::{Node, SlotInner};
+use crate::node::{is_child, Node, SLOT_DATA};
 
 /// Look up a key in the tree, returning a reference to the value if found.
 ///
 /// The returned reference is valid for the lifetime of the guard.
-pub fn get<'g, K: Key, V>(node: &Node<K, V>, key: &K, guard: &'g Guard) -> Option<&'g V> {
+pub fn get<'g, K: Key, V>(node: &'g Node<K, V>, key: &K, guard: &'g Guard) -> Option<&'g V> {
     let mut current_node = node;
     loop {
         let slot_idx = current_node.predict_slot(key);
-        let shared: Shared<'g, SlotInner<K, V>> =
-            current_node.slot(slot_idx).load(Ordering::Acquire, guard);
+        let state = current_node.slot_state(slot_idx);
 
-        if shared.is_null() {
-            return None;
-        }
-
-        // SAFETY: shared is not null and is valid for the lifetime of the guard.
-        // The epoch-based reclamation ensures the data won't be freed while our
-        // guard is active.
-        match unsafe { shared.deref() } {
-            SlotInner::Data { key: k, value } => {
-                return if k == key { Some(value) } else { None };
+        match state {
+            SLOT_DATA => {
+                // SAFETY: state is DATA so inline data is valid and immutable.
+                let k = unsafe { current_node.read_key(slot_idx) };
+                return if k == key {
+                    Some(unsafe { current_node.read_value(slot_idx) })
+                } else {
+                    None
+                };
             }
-            SlotInner::Child(child) => {
-                current_node = child;
+            s if is_child(s) => {
+                let child_shared = current_node.load_child(slot_idx, guard);
+                if child_shared.is_null() {
+                    return None;
+                }
+                // SAFETY: child_shared is valid for guard lifetime.
+                current_node = unsafe { child_shared.deref() };
             }
+            _ => return None, // EMPTY, WRITING, TOMBSTONE
         }
     }
-}
-
-/// Check whether a key exists in the tree.
-#[cfg(test)]
-fn contains_key<K: Key, V>(node: &Node<K, V>, key: &K, guard: &Guard) -> bool {
-    get(node, key, guard).is_some()
 }
 
 #[cfg(test)]
@@ -89,9 +85,9 @@ mod tests {
     fn contains_key_works() {
         let g = guard();
         let tree = build_test_tree();
-        assert!(contains_key(&tree, &10, &g));
-        assert!(contains_key(&tree, &50, &g));
-        assert!(!contains_key(&tree, &99, &g));
+        assert!(get(&tree, &10, &g).is_some());
+        assert!(get(&tree, &50, &g).is_some());
+        assert!(get(&tree, &99, &g).is_none());
     }
 
     #[test]

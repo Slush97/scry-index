@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::key::Key;
 use crate::model::{fit_fmcd, LinearModel};
-use crate::node::{Node, SlotInner};
+use crate::node::Node;
 
 /// Build a learned index tree from sorted key-value pairs.
 ///
@@ -32,42 +32,37 @@ pub fn bulk_load<K: Key, V: Clone>(pairs: &[(K, V)], config: &Config) -> Result<
 
 /// Recursively build a subtree from a sorted slice of key-value pairs.
 pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Config) -> Node<K, V> {
-    let keys: Vec<K> = pairs.iter().map(|(k, _)| k.clone()).collect();
-    let n = keys.len();
+    let n = pairs.len();
 
     // Check for degenerate case: all keys share the same f64 model input.
-    // This happens for integer keys above 2^53 where f64 precision is lost.
-    // Without this check, fit_fmcd produces slope=0 and all keys collide,
-    // causing infinite recursion.
     if n > 1 {
-        let first_f = keys[0].to_model_input();
-        let last_f = keys[n - 1].to_model_input();
+        let first_f = pairs[0].0.to_model_input();
+        let last_f = pairs[n - 1].0.to_model_input();
         if (last_f - first_f).abs() < f64::EPSILON {
             return build_degenerate(pairs);
         }
     }
 
-    let result = fit_fmcd(&keys, config.expansion_factor, config.range_headroom);
+    // Pass pairs directly — fit_fmcd extracts keys via closure, avoiding a
+    // separate Vec<K> allocation.
+    let result = fit_fmcd(
+        n,
+        |i| pairs[i].0.to_model_input(),
+        config.expansion_factor,
+        config.range_headroom,
+    );
 
     let node = Node::with_capacity(result.model, result.array_size);
 
     if result.conflicts == 0 {
-        // No conflicts — place each key-value directly in its predicted slot
+        // No conflicts — place each key-value directly in its predicted slot.
         for (key, value) in pairs {
             let slot = node.predict_slot(key);
-            node.store_slot(
-                slot,
-                SlotInner::Data {
-                    key: key.clone(),
-                    value: value.clone(),
-                },
-            );
+            node.store_data(slot, key.clone(), value.clone());
             node.inc_keys();
         }
     } else {
         // Conflicts exist — sort by predicted slot, then process runs.
-        // This avoids allocating one Vec per slot (which can be huge for large
-        // array_size with few actual conflicts).
         let mut assignments: Vec<(usize, usize)> = pairs
             .iter()
             .enumerate()
@@ -85,13 +80,7 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
             let run = &assignments[start..i];
             if run.len() == 1 {
                 let (k, v) = &pairs[run[0].1];
-                node.store_slot(
-                    slot_idx,
-                    SlotInner::Data {
-                        key: k.clone(),
-                        value: v.clone(),
-                    },
-                );
+                node.store_data(slot_idx, k.clone(), v.clone());
                 node.inc_keys();
             } else {
                 let child_pairs: Vec<(K, V)> = run
@@ -101,13 +90,12 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
                         (k.clone(), v.clone())
                     })
                     .collect();
-                // Check if this conflict group is degenerate (all same f64).
                 let child = if is_degenerate_group(&child_pairs) {
                     build_degenerate(&child_pairs)
                 } else {
                     build_recursive(&child_pairs, config)
                 };
-                node.store_slot(slot_idx, SlotInner::Child(child));
+                node.store_child(slot_idx, child);
             }
         }
     }
@@ -126,29 +114,16 @@ fn is_degenerate_group<K: Key, V>(pairs: &[(K, V)]) -> bool {
 }
 
 /// Build a balanced binary tree for keys that share the same f64 representation.
-///
-/// Uses midpoint binary splits via `to_exact_ordinal` at each level. Guaranteed
-/// to terminate because each split halves the key count and `to_exact_ordinal`
-/// is injective (distinct keys always get different ordinals).
-///
-/// Pairs must be sorted by key (invariant from `bulk_load`).
 fn build_degenerate<K: Key, V: Clone>(pairs: &[(K, V)]) -> Node<K, V> {
     debug_assert!(!pairs.is_empty());
 
     if pairs.len() == 1 {
         let node = Node::with_capacity(LinearModel::constant(), 1);
-        node.store_slot(
-            0,
-            SlotInner::Data {
-                key: pairs[0].0.clone(),
-                value: pairs[0].1.clone(),
-            },
-        );
+        node.store_data(0, pairs[0].0.clone(), pairs[0].1.clone());
         node.inc_keys();
         return node;
     }
 
-    // Split at median. Pairs are sorted, so left half < right half.
     let mid_idx = pairs.len() / 2;
     let lo_half = &pairs[..mid_idx];
     let hi_half = &pairs[mid_idx..];
@@ -157,8 +132,6 @@ fn build_degenerate<K: Key, V: Clone>(pairs: &[(K, V)]) -> Node<K, V> {
     let hi_first_ord = hi_half.first().unwrap().0.to_exact_ordinal();
 
     let node = if lo_last_ord == hi_first_ord {
-        // Ordinals collide (e.g., variable-length keys sharing a 16-byte
-        // prefix). Fall back to Ord-based split using the boundary key.
         Node::with_split_key(lo_half.last().unwrap().0.clone(), 2)
     } else {
         let midpoint = lo_last_ord + (hi_first_ord - lo_last_ord) / 2;
@@ -167,31 +140,19 @@ fn build_degenerate<K: Key, V: Clone>(pairs: &[(K, V)]) -> Node<K, V> {
     };
 
     if lo_half.len() == 1 {
-        node.store_slot(
-            0,
-            SlotInner::Data {
-                key: lo_half[0].0.clone(),
-                value: lo_half[0].1.clone(),
-            },
-        );
+        node.store_data(0, lo_half[0].0.clone(), lo_half[0].1.clone());
         node.inc_keys();
     } else {
         let child = build_degenerate(lo_half);
-        node.store_slot(0, SlotInner::Child(child));
+        node.store_child(0, child);
     }
 
     if hi_half.len() == 1 {
-        node.store_slot(
-            1,
-            SlotInner::Data {
-                key: hi_half[0].0.clone(),
-                value: hi_half[0].1.clone(),
-            },
-        );
+        node.store_data(1, hi_half[0].0.clone(), hi_half[0].1.clone());
         node.inc_keys();
     } else {
         let child = build_degenerate(hi_half);
-        node.store_slot(1, SlotInner::Child(child));
+        node.store_child(1, child);
     }
 
     node

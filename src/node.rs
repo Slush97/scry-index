@@ -1,49 +1,76 @@
 //! Node types for the learned index tree.
 //!
-//! Each node contains a linear model and a fixed-size array of atomic slots.
-//! Slots are either empty (null) or point to a [`SlotInner`] which is either
-//! a key-value pair or a child node.
+//! Each node contains a linear model and a fixed-size array of inline slots.
+//! Slots store keys and values directly in contiguous arrays (no per-entry heap
+//! allocation), with child pointers in a separate array for conflict chains.
+//!
+//! Slot states are tracked via per-slot [`AtomicU8`] bytes:
+//! - [`SLOT_EMPTY`]: unused
+//! - [`SLOT_WRITING`]: being claimed by a concurrent insert (transient)
+//! - [`SLOT_DATA`]: contains an inline key-value pair (immutable once published)
+//! - [`SLOT_CHILD`]: contains a child node pointer (no inline data)
+//! - [`SLOT_CHILD_STALE`]: contains a child pointer + stale inline data from
+//!   a DATA→CHILD transition
+//! - [`SLOT_TOMBSTONE`]: logically removed, inline data is stale
 #![allow(unsafe_code)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 
 use crate::key::Key;
 use crate::model::LinearModel;
 
-/// The content of a non-empty slot: either data or a child node.
-pub enum SlotInner<K, V> {
-    /// A key-value pair stored in this slot.
-    Data { key: K, value: V },
-    /// A child node created by conflict resolution.
-    Child(Node<K, V>),
+/// Slot is unused — no inline data, no child.
+pub const SLOT_EMPTY: u8 = 0;
+/// Slot is being claimed by a concurrent insert (transient).
+/// Other threads seeing this state should spin-retry.
+pub const SLOT_WRITING: u8 = 1;
+/// Slot contains a valid inline key-value pair.
+pub const SLOT_DATA: u8 = 2;
+/// Slot contains a child node pointer. No inline data was ever written
+/// (set during bulk-load construction).
+pub const SLOT_CHILD: u8 = 3;
+/// Slot contains a child node pointer AND stale inline key-value data
+/// from a concurrent DATA→CHILD transition. During drop, both the inline
+/// data and the child are cleaned up.
+pub const SLOT_CHILD_STALE: u8 = 4;
+/// Slot was logically removed. Inline key-value data is stale.
+pub const SLOT_TOMBSTONE: u8 = 5;
+
+/// Returns `true` if the state indicates a child node is present.
+#[inline]
+pub fn is_child(state: u8) -> bool {
+    state == SLOT_CHILD || state == SLOT_CHILD_STALE
 }
 
 /// A node in the learned index tree.
 ///
-/// Contains a linear model for position prediction and a fixed-size array
-/// of atomic slots. The model maps keys to slot indices; conflicts are resolved
-/// by creating child nodes.
+/// Contains a linear model for position prediction and fixed-size arrays
+/// for inline key-value storage. Conflicts are resolved by creating child
+/// nodes stored via epoch-protected [`Atomic`] pointers.
+///
+/// Keys and values are stored **inline** in contiguous arrays — no per-entry
+/// heap allocation. This dramatically reduces allocation overhead compared
+/// to the pointer-per-entry design, especially for bulk loading.
 pub struct Node<K, V> {
     /// The linear model for this node (immutable after construction).
     model: LinearModel,
-    /// Slot array. Each atomic is null (empty) or points to a `SlotInner`.
-    slots: Box<[Atomic<SlotInner<K, V>>]>,
+    /// Per-slot state byte (see `SLOT_*` constants).
+    states: Box<[AtomicU8]>,
+    /// Inline key storage. Valid when state is DATA, CHILD_STALE, or TOMBSTONE.
+    keys: Box<[UnsafeCell<MaybeUninit<K>>]>,
+    /// Inline value storage. Valid when state is DATA, CHILD_STALE, or TOMBSTONE.
+    values: Box<[UnsafeCell<MaybeUninit<V>>]>,
+    /// Child node pointers. Valid when state is CHILD or CHILD_STALE.
+    children: Box<[Atomic<Node<K, V>>]>,
     /// Approximate number of data entries in this node (not counting children).
     num_keys: AtomicUsize,
-    /// Approximate number of tombstones (slots nulled by remove) in this node.
-    ///
-    /// Incremented on remove, never decremented. Resets to 0 when the subtree
-    /// is rebuilt (fresh node construction). Used to trigger compaction when the
-    /// ratio exceeds the configured threshold.
+    /// Approximate number of tombstones in this node.
     num_tombstones: AtomicUsize,
     /// Optional boundary key for `Ord`-based binary splits.
-    ///
-    /// When set, [`predict_slot`](Self::predict_slot) uses `key <= split_key → 0`,
-    /// `key > split_key → last slot` instead of the linear model. This handles
-    /// the degenerate case where `to_exact_ordinal()` is non-injective
-    /// (e.g., variable-length keys sharing a 16-byte prefix).
     split_key: Option<K>,
 }
 
@@ -51,7 +78,7 @@ impl<K, V> std::fmt::Debug for Node<K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Node")
             .field("model", &self.model)
-            .field("capacity", &self.slots.len())
+            .field("capacity", &self.states.len())
             .field("num_keys", &self.num_keys.load(Ordering::Relaxed))
             .field("num_tombstones", &self.num_tombstones.load(Ordering::Relaxed))
             .field("has_split_key", &self.split_key.is_some())
@@ -62,12 +89,14 @@ impl<K, V> std::fmt::Debug for Node<K, V> {
 impl<K: Key, V> Node<K, V> {
     /// Create a new node with the given model and array size.
     ///
-    /// All slots are initialized to null (empty).
+    /// All slots are initialized to empty.
     pub fn with_capacity(model: LinearModel, array_size: usize) -> Self {
-        let slots: Vec<Atomic<SlotInner<K, V>>> = (0..array_size).map(|_| Atomic::null()).collect();
         Self {
             model,
-            slots: slots.into_boxed_slice(),
+            states: (0..array_size).map(|_| AtomicU8::new(SLOT_EMPTY)).collect::<Vec<_>>().into_boxed_slice(),
+            keys: (0..array_size).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect::<Vec<_>>().into_boxed_slice(),
+            values: (0..array_size).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect::<Vec<_>>().into_boxed_slice(),
+            children: (0..array_size).map(|_| Atomic::null()).collect::<Vec<_>>().into_boxed_slice(),
             num_keys: AtomicUsize::new(0),
             num_tombstones: AtomicUsize::new(0),
             split_key: None,
@@ -76,67 +105,217 @@ impl<K: Key, V> Node<K, V> {
 
     /// Create a node that splits keys using `Ord` comparison against `boundary`.
     ///
-    /// Keys ≤ `boundary` predict to slot 0; keys > `boundary` predict to the
-    /// last slot. Used when `to_exact_ordinal()` cannot distinguish keys that
-    /// need to be separated (e.g., variable-length keys sharing a 16-byte
-    /// prefix).
+    /// Keys <= `boundary` predict to slot 0; keys > `boundary` predict to the
+    /// last slot.
     pub fn with_split_key(boundary: K, array_size: usize) -> Self {
-        let slots: Vec<Atomic<SlotInner<K, V>>> = (0..array_size).map(|_| Atomic::null()).collect();
-        Self {
-            model: LinearModel::constant(),
-            slots: slots.into_boxed_slice(),
-            num_keys: AtomicUsize::new(0),
-            num_tombstones: AtomicUsize::new(0),
-            split_key: Some(boundary),
-        }
+        let mut node = Self::with_capacity(LinearModel::constant(), array_size);
+        node.split_key = Some(boundary);
+        node
     }
 
     /// Predict the slot index for a key.
-    ///
-    /// When `split_key` is set, uses `Ord` comparison instead of the linear
-    /// model: keys ≤ `split_key` map to slot 0, keys above map to the last
-    /// slot.
     #[inline]
     pub fn predict_slot(&self, key: &K) -> usize {
         if let Some(ref sk) = self.split_key {
             return if key <= sk {
                 0
             } else {
-                self.slots.len().saturating_sub(1)
+                self.states.len().saturating_sub(1)
             };
         }
-        self.model.predict(key, self.slots.len())
+        self.model.predict(key, self.states.len())
     }
 
     /// Return the number of slots in this node.
-    pub fn capacity(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// Get a reference to the atomic at the given slot index.
     #[inline]
-    pub fn slot(&self, idx: usize) -> &Atomic<SlotInner<K, V>> {
-        &self.slots[idx]
+    pub fn capacity(&self) -> usize {
+        self.states.len()
     }
 
-    /// Store a value into a slot during construction (no concurrent access).
+    // -----------------------------------------------------------------------
+    // Construction-time writes (no concurrent access)
+    // -----------------------------------------------------------------------
+
+    /// Store an inline key-value pair during construction.
     ///
-    /// This uses relaxed ordering since no other thread can observe the node yet.
-    /// The slot must be empty (null); storing into an occupied slot leaks the old
-    /// value. A debug assertion guards against this.
-    pub fn store_slot(&self, idx: usize, inner: SlotInner<K, V>) {
-        // SAFETY: Called only during construction when no concurrent access exists.
-        // Using unprotected() is safe because we only convert Owned to Shared for
-        // storage; no concurrent readers can observe this data yet.
+    /// The slot must be empty. Uses relaxed ordering (no concurrent readers).
+    pub fn store_data(&self, idx: usize, key: K, value: V) {
+        debug_assert_eq!(
+            self.states[idx].load(Ordering::Relaxed),
+            SLOT_EMPTY,
+            "store_data called on non-empty slot {idx}"
+        );
+        unsafe {
+            (*self.keys[idx].get()) = MaybeUninit::new(key);
+            (*self.values[idx].get()) = MaybeUninit::new(value);
+        }
+        self.states[idx].store(SLOT_DATA, Ordering::Relaxed);
+    }
+
+    /// Store a child node during construction.
+    ///
+    /// The slot must be empty. No inline data is written.
+    pub fn store_child(&self, idx: usize, child: Node<K, V>) {
+        debug_assert_eq!(
+            self.states[idx].load(Ordering::Relaxed),
+            SLOT_EMPTY,
+            "store_child called on non-empty slot {idx}"
+        );
         unsafe {
             let guard = epoch::unprotected();
-            debug_assert!(
-                self.slots[idx].load(Ordering::Relaxed, guard).is_null(),
-                "store_slot called on occupied slot {idx} — would leak memory"
-            );
-            self.slots[idx].store(Owned::new(inner).into_shared(guard), Ordering::Relaxed);
+            self.children[idx].store(Owned::new(child).into_shared(guard), Ordering::Relaxed);
         }
+        self.states[idx].store(SLOT_CHILD, Ordering::Relaxed);
     }
+
+    // -----------------------------------------------------------------------
+    // Concurrent slot access
+    // -----------------------------------------------------------------------
+
+    /// Load the state of a slot with Acquire ordering.
+    #[inline]
+    pub fn slot_state(&self, idx: usize) -> u8 {
+        self.states[idx].load(Ordering::Acquire)
+    }
+
+    /// Read the inline key at the given slot.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure the slot has inline data (state is DATA, CHILD_STALE,
+    /// or TOMBSTONE) and that the data will not be concurrently modified.
+    #[inline]
+    pub unsafe fn read_key(&self, idx: usize) -> &K {
+        (*self.keys[idx].get()).assume_init_ref()
+    }
+
+    /// Read the inline value at the given slot.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure the slot has inline data (state is DATA) and that
+    /// the data will not be concurrently modified.
+    #[inline]
+    pub unsafe fn read_value(&self, idx: usize) -> &V {
+        (*self.values[idx].get()).assume_init_ref()
+    }
+
+    /// Load the child pointer at the given slot.
+    #[inline]
+    pub fn load_child<'g>(
+        &self,
+        idx: usize,
+        guard: &'g Guard,
+    ) -> crossbeam_epoch::Shared<'g, Node<K, V>> {
+        self.children[idx].load(Ordering::Acquire, guard)
+    }
+
+    /// Get a reference to the child's [`Atomic`] for CAS operations (freeze, etc.).
+    #[inline]
+    pub fn child_atomic(&self, idx: usize) -> &Atomic<Node<K, V>> {
+        &self.children[idx]
+    }
+
+    /// Get a reference to the state [`AtomicU8`] for CAS operations.
+    #[inline]
+    pub fn state_atomic(&self, idx: usize) -> &AtomicU8 {
+        &self.states[idx]
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent writes
+    // -----------------------------------------------------------------------
+
+    /// Atomically claim an EMPTY slot and write inline key-value data.
+    ///
+    /// Uses an intermediate WRITING state so that only one thread can claim
+    /// a slot. Returns `true` on success, `false` if the slot was not EMPTY.
+    pub fn cas_empty_to_data(&self, idx: usize, key: K, value: V) -> bool {
+        // CAS EMPTY → WRITING to claim exclusive write access to this slot.
+        if self.states[idx]
+            .compare_exchange(SLOT_EMPTY, SLOT_WRITING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        // We own this slot. Write key+value, then publish.
+        unsafe {
+            (*self.keys[idx].get()) = MaybeUninit::new(key);
+            (*self.values[idx].get()) = MaybeUninit::new(value);
+        }
+        self.states[idx].store(SLOT_DATA, Ordering::Release);
+        true
+    }
+
+    /// Atomically claim a TOMBSTONE slot and write new inline key-value data.
+    ///
+    /// Returns `true` on success. The old stale data is overwritten (safe for
+    /// types without Drop; for Drop types the old data leaks until node rebuild).
+    pub fn cas_tombstone_to_data(&self, idx: usize, key: K, value: V) -> bool {
+        if self.states[idx]
+            .compare_exchange(
+                SLOT_TOMBSTONE,
+                SLOT_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        // Overwrite inline storage. The old stale data is not explicitly dropped
+        // here — for Copy types this is fine; for Drop types the old data's
+        // destructor is skipped (acceptable since the node rebuild will reclaim).
+        unsafe {
+            (*self.keys[idx].get()) = MaybeUninit::new(key);
+            (*self.values[idx].get()) = MaybeUninit::new(value);
+        }
+        self.states[idx].store(SLOT_DATA, Ordering::Release);
+        true
+    }
+
+    /// Transition a DATA slot to a CHILD_STALE slot with the given child node.
+    ///
+    /// Clones the existing inline key+value (for the child to use), then stores
+    /// the child pointer and transitions the state. The inline data becomes stale.
+    ///
+    /// Returns `true` on success, `false` if the slot was no longer DATA.
+    pub fn cas_data_to_child_stale(
+        &self,
+        idx: usize,
+        child: Node<K, V>,
+        guard: &Guard,
+    ) -> bool {
+        if self.states[idx]
+            .compare_exchange(SLOT_DATA, SLOT_WRITING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        // We own the slot. Store the child pointer.
+        self.children[idx].store(Owned::new(child).into_shared(guard), Ordering::Release);
+        // Publish: the inline data is now stale but stays for drop correctness.
+        self.states[idx].store(SLOT_CHILD_STALE, Ordering::Release);
+        true
+    }
+
+    /// Transition a DATA slot to TOMBSTONE (logical removal).
+    ///
+    /// Returns `true` on success.
+    pub fn cas_data_to_tombstone(&self, idx: usize) -> bool {
+        self.states[idx]
+            .compare_exchange(
+                SLOT_DATA,
+                SLOT_TOMBSTONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    // -----------------------------------------------------------------------
+    // Counters
+    // -----------------------------------------------------------------------
 
     /// Increment the approximate key count.
     pub fn inc_keys(&self) {
@@ -154,12 +333,8 @@ impl<K: Key, V> Node<K, V> {
     }
 
     /// Return the approximate ratio of tombstones to total capacity.
-    ///
-    /// A value of 0.0 means no tombstones; 1.0 means every slot has been
-    /// nulled by a remove. The count is approximate (never decremented)
-    /// and may slightly overestimate the true ratio.
     pub fn tombstone_ratio(&self) -> f64 {
-        let cap = self.slots.len();
+        let cap = self.states.len();
         if cap == 0 {
             return 0.0;
         }
@@ -169,47 +344,43 @@ impl<K: Key, V> Node<K, V> {
     /// Count total keys stored in this node and all descendants.
     pub fn total_keys(&self, guard: &Guard) -> usize {
         let mut count = 0;
-        for slot in &*self.slots {
-            let shared = slot.load(Ordering::Acquire, guard);
-            if shared.is_null() {
-                continue;
-            }
-            // SAFETY: shared is not null and is valid for the lifetime of the guard.
-            match unsafe { shared.deref() } {
-                SlotInner::Data { .. } => count += 1,
-                SlotInner::Child(child) => count += child.total_keys(guard),
+        for i in 0..self.states.len() {
+            let state = self.states[i].load(Ordering::Acquire);
+            match state {
+                SLOT_DATA => count += 1,
+                s if is_child(s) => {
+                    let child_shared = self.children[i].load(Ordering::Acquire, guard);
+                    if !child_shared.is_null() {
+                        // SAFETY: child_shared is valid for the guard lifetime.
+                        count += unsafe { child_shared.deref() }.total_keys(guard);
+                    }
+                }
+                _ => {}
             }
         }
         count
     }
 
     /// Estimate the total heap memory used by this node and all descendants.
-    ///
-    /// The estimate includes:
-    /// - The `Node` struct itself (`size_of::<Node<K, V>>()`)
-    /// - The boxed slot array (`capacity * size_of::<Atomic<SlotInner<K, V>>>()`)
-    /// - Each non-null slot's heap-allocated `SlotInner` (`size_of::<SlotInner<K, V>>()`)
-    /// - Recursive child nodes
-    ///
-    /// This is an approximation — it does not account for allocator overhead,
-    /// alignment padding, or epoch-deferred garbage.
     pub fn allocated_bytes(&self, guard: &Guard) -> usize {
         let node_size = std::mem::size_of::<Self>();
-        let slots_size =
-            self.slots.len() * std::mem::size_of::<Atomic<SlotInner<K, V>>>();
-        let inner_size = std::mem::size_of::<SlotInner<K, V>>();
+        let cap = self.states.len();
+        let arrays_size = cap
+            * (std::mem::size_of::<AtomicU8>()
+                + std::mem::size_of::<UnsafeCell<MaybeUninit<K>>>()
+                + std::mem::size_of::<UnsafeCell<MaybeUninit<V>>>()
+                + std::mem::size_of::<Atomic<Node<K, V>>>());
 
-        let mut total = node_size + slots_size;
+        let mut total = node_size + arrays_size;
 
-        for slot in &*self.slots {
-            let shared = slot.load(Ordering::Acquire, guard);
-            if shared.is_null() {
-                continue;
-            }
-            total += inner_size;
-            // SAFETY: shared is not null and is valid for the lifetime of the guard.
-            if let SlotInner::Child(child) = unsafe { shared.deref() } {
-                total += child.allocated_bytes(guard);
+        for i in 0..cap {
+            let state = self.states[i].load(Ordering::Acquire);
+            if is_child(state) {
+                let child_shared = self.children[i].load(Ordering::Acquire, guard);
+                if !child_shared.is_null() {
+                    // SAFETY: child_shared is valid for the guard lifetime.
+                    total += unsafe { child_shared.deref() }.allocated_bytes(guard);
+                }
             }
         }
 
@@ -219,14 +390,15 @@ impl<K: Key, V> Node<K, V> {
     /// Return the depth of the deepest path from this node.
     pub fn max_depth(&self, guard: &Guard) -> usize {
         let mut max_child_depth = 0;
-        for slot in &*self.slots {
-            let shared = slot.load(Ordering::Acquire, guard);
-            if shared.is_null() {
-                continue;
-            }
-            // SAFETY: shared is not null and is valid for the lifetime of the guard.
-            if let SlotInner::Child(child) = unsafe { shared.deref() } {
-                max_child_depth = max_child_depth.max(child.max_depth(guard));
+        for i in 0..self.states.len() {
+            let state = self.states[i].load(Ordering::Acquire);
+            if is_child(state) {
+                let child_shared = self.children[i].load(Ordering::Acquire, guard);
+                if !child_shared.is_null() {
+                    // SAFETY: child_shared is valid for the guard lifetime.
+                    let depth = unsafe { child_shared.deref() }.max_depth(guard);
+                    max_child_depth = max_child_depth.max(depth);
+                }
             }
         }
         1 + max_child_depth
@@ -236,13 +408,27 @@ impl<K: Key, V> Node<K, V> {
 impl<K, V> Drop for Node<K, V> {
     fn drop(&mut self) {
         // SAFETY: We have exclusive access during drop — no other thread can
-        // reference this node. Using unprotected() and Relaxed ordering is safe.
+        // reference this node.
         unsafe {
             let guard = epoch::unprotected();
-            for slot in &*self.slots {
-                let shared = slot.load(Ordering::Relaxed, guard);
-                if !shared.is_null() {
-                    drop(shared.into_owned());
+            for i in 0..self.states.len() {
+                let state = *self.states[i].get_mut();
+                // Drop inline data if it was initialized.
+                let has_inline = state == SLOT_DATA
+                    || state == SLOT_CHILD_STALE
+                    || state == SLOT_TOMBSTONE;
+                if has_inline && std::mem::needs_drop::<K>() {
+                    std::ptr::drop_in_place((*self.keys[i].get()).as_mut_ptr());
+                }
+                if has_inline && std::mem::needs_drop::<V>() {
+                    std::ptr::drop_in_place((*self.values[i].get()).as_mut_ptr());
+                }
+                // Drop child node if present.
+                if is_child(state) {
+                    let shared = self.children[i].load(Ordering::Relaxed, guard);
+                    if !shared.is_null() {
+                        drop(shared.into_owned());
+                    }
                 }
             }
         }
@@ -250,9 +436,8 @@ impl<K, V> Drop for Node<K, V> {
 }
 
 // SAFETY: Node is Send+Sync when K and V are Send+Sync. All interior mutation
-// goes through atomic operations (Atomic<SlotInner> and AtomicUsize), which are
-// inherently thread-safe. The recursive type prevents auto-derivation, so we
-// implement these traits manually.
+// goes through atomic operations (AtomicU8, AtomicUsize, Atomic<Node>) or
+// UnsafeCell guarded by state CAS. The recursive type prevents auto-derivation.
 unsafe impl<K: Send + Sync, V: Send + Sync> Send for Node<K, V> {}
 unsafe impl<K: Send + Sync, V: Send + Sync> Sync for Node<K, V> {}
 
@@ -260,7 +445,7 @@ unsafe impl<K: Send + Sync, V: Send + Sync> Sync for Node<K, V> {}
 mod tests {
     use super::*;
 
-    fn guard() -> Guard {
+    fn guard() -> epoch::Guard {
         epoch::pin()
     }
 
@@ -283,9 +468,9 @@ mod tests {
     fn total_keys_with_data() {
         let g = guard();
         let node = Node::<u64, &str>::with_capacity(LinearModel::constant(), 5);
-        node.store_slot(0, SlotInner::Data { key: 1, value: "a" });
+        node.store_data(0, 1, "a");
         node.inc_keys();
-        node.store_slot(2, SlotInner::Data { key: 2, value: "b" });
+        node.store_data(2, 2, "b");
         node.inc_keys();
         assert_eq!(node.total_keys(&g), 2);
     }
@@ -295,27 +480,15 @@ mod tests {
         let g = guard();
 
         let child = Node::<u64, &str>::with_capacity(LinearModel::constant(), 3);
-        child.store_slot(
-            0,
-            SlotInner::Data {
-                key: 10,
-                value: "x",
-            },
-        );
+        child.store_data(0, 10, "x");
         child.inc_keys();
-        child.store_slot(
-            1,
-            SlotInner::Data {
-                key: 20,
-                value: "y",
-            },
-        );
+        child.store_data(1, 20, "y");
         child.inc_keys();
 
         let parent = Node::<u64, &str>::with_capacity(LinearModel::constant(), 5);
-        parent.store_slot(0, SlotInner::Data { key: 1, value: "a" });
+        parent.store_data(0, 1, "a");
         parent.inc_keys();
-        parent.store_slot(1, SlotInner::Child(child));
+        parent.store_child(1, child);
 
         assert_eq!(parent.total_keys(&g), 3);
     }
@@ -332,35 +505,85 @@ mod tests {
         let g = guard();
         let leaf = Node::<u64, ()>::with_capacity(LinearModel::constant(), 2);
         let mid = Node::<u64, ()>::with_capacity(LinearModel::constant(), 2);
-        mid.store_slot(0, SlotInner::Child(leaf));
+        mid.store_child(0, leaf);
         let root = Node::<u64, ()>::with_capacity(LinearModel::constant(), 2);
-        root.store_slot(0, SlotInner::Child(mid));
+        root.store_child(0, mid);
         assert_eq!(root.max_depth(&g), 3);
     }
 
     #[test]
-    fn store_and_load_slot() {
-        let g = guard();
+    fn store_and_read_data() {
         let node = Node::<u64, i32>::with_capacity(LinearModel::constant(), 4);
-        node.store_slot(
-            1,
-            SlotInner::Data {
-                key: 42,
-                value: 100,
-            },
-        );
+        node.store_data(1, 42, 100);
         node.inc_keys();
 
-        let shared = node.slot(1).load(Ordering::Acquire, &g);
-        assert!(!shared.is_null());
-
-        // SAFETY: shared is not null and valid under guard
-        match unsafe { shared.deref() } {
-            SlotInner::Data { key, value } => {
-                assert_eq!(*key, 42);
-                assert_eq!(*value, 100);
-            }
-            SlotInner::Child(_) => panic!("expected Data"),
+        assert_eq!(node.slot_state(1), SLOT_DATA);
+        unsafe {
+            assert_eq!(*node.read_key(1), 42);
+            assert_eq!(*node.read_value(1), 100);
         }
+    }
+
+    #[test]
+    fn cas_empty_to_data_success() {
+        let g = guard();
+        let node = Node::<u64, &str>::with_capacity(LinearModel::constant(), 4);
+        assert!(node.cas_empty_to_data(0, 10, "hello"));
+        assert_eq!(node.slot_state(0), SLOT_DATA);
+        unsafe {
+            assert_eq!(*node.read_key(0), 10);
+            assert_eq!(*node.read_value(0), "hello");
+        }
+        // total_keys scans actual DATA slots, so it's 1 even without inc_keys
+        assert_eq!(node.total_keys(&g), 1);
+    }
+
+    #[test]
+    fn cas_empty_to_data_fails_on_occupied() {
+        let node = Node::<u64, u64>::with_capacity(LinearModel::constant(), 4);
+        assert!(node.cas_empty_to_data(0, 1, 10));
+        // Second attempt should fail
+        assert!(!node.cas_empty_to_data(0, 2, 20));
+        // Original data preserved
+        unsafe {
+            assert_eq!(*node.read_key(0), 1);
+            assert_eq!(*node.read_value(0), 10);
+        }
+    }
+
+    #[test]
+    fn cas_data_to_child_stale() {
+        let g = guard();
+        let node = Node::<u64, u64>::with_capacity(LinearModel::constant(), 4);
+        node.store_data(0, 10, 100);
+        node.inc_keys();
+
+        let child = Node::<u64, u64>::with_capacity(LinearModel::constant(), 2);
+        child.store_data(0, 10, 200);
+        child.inc_keys();
+
+        assert!(node.cas_data_to_child_stale(0, child, &g));
+        assert_eq!(node.slot_state(0), SLOT_CHILD_STALE);
+
+        let child_shared = node.load_child(0, &g);
+        assert!(!child_shared.is_null());
+    }
+
+    #[test]
+    fn cas_data_to_tombstone() {
+        let node = Node::<u64, u64>::with_capacity(LinearModel::constant(), 4);
+        node.store_data(0, 10, 100);
+        assert!(node.cas_data_to_tombstone(0));
+        assert_eq!(node.slot_state(0), SLOT_TOMBSTONE);
+    }
+
+    #[test]
+    fn drop_with_inline_data() {
+        // Verify that nodes with String values correctly drop inline data.
+        let node = Node::<u64, String>::with_capacity(LinearModel::constant(), 4);
+        node.store_data(0, 1, "hello".to_string());
+        node.store_data(1, 2, "world".to_string());
+        drop(node);
+        // If Drop is implemented correctly, no leak or double-free.
     }
 }

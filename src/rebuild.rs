@@ -5,10 +5,10 @@
 //! This replaces the global `RwLock`-protected rebuild with fine-grained,
 //! lock-free subtree compaction.
 //!
-//! The rebuild uses a **freeze protocol** to prevent data loss: the parent slot
-//! is tagged (frozen) before the snapshot so concurrent inserts spin-wait. A
-//! post-CAS recovery scan catches in-flight inserts that loaded the child
-//! pointer before the freeze.
+//! The rebuild uses a **freeze protocol** to prevent data loss: the parent's
+//! child pointer is tagged (frozen) before the snapshot so concurrent inserts
+//! spin-wait. A post-CAS recovery scan catches in-flight inserts that loaded
+//! the child pointer before the freeze.
 #![allow(unsafe_code)]
 
 use std::sync::atomic::Ordering;
@@ -19,17 +19,17 @@ use crate::build;
 use crate::config::Config;
 use crate::iter;
 use crate::key::Key;
-use crate::node::{Node, SlotInner};
+use crate::node::{is_child, Node};
 
-/// RAII guard that unfreezes a slot if the rebuild doesn't complete normally.
+/// RAII guard that unfreezes a child pointer if the rebuild doesn't complete normally.
 ///
-/// On drop (including panic unwind), CAS the slot back from the frozen
+/// On drop (including panic unwind), CAS the child pointer back from the frozen
 /// (tagged) pointer to the original untagged pointer. This prevents a
 /// stuck freeze from blocking all inserts into the subtree forever.
 struct FreezeGuard<'a, 'g, K, V> {
-    slot: &'a Atomic<SlotInner<K, V>>,
-    frozen: Shared<'g, SlotInner<K, V>>,
-    original: Shared<'g, SlotInner<K, V>>,
+    slot: &'a Atomic<Node<K, V>>,
+    frozen: Shared<'g, Node<K, V>>,
+    original: Shared<'g, Node<K, V>>,
     guard: &'g Guard,
     disarmed: bool,
 }
@@ -48,7 +48,8 @@ impl<K, V> Drop for FreezeGuard<'_, '_, K, V> {
     }
 }
 
-/// Attempt to rebuild a degraded subtree at `parent_node.slot(parent_slot_idx)`.
+/// Attempt to rebuild a degraded subtree at `parent_node`'s child in slot
+/// `parent_slot_idx`.
 ///
 /// If the slot contains a child node, collects all its key-value pairs, builds
 /// a fresh subtree with a boosted expansion factor, and CAS-swaps it in place.
@@ -60,7 +61,7 @@ impl<K, V> Drop for FreezeGuard<'_, '_, K, V> {
 ///
 /// - Two threads rebuilding the same subtree: the first freeze-CAS wins, the
 ///   other returns false immediately. Safe.
-/// - Insert races with rebuild: the parent slot is *frozen* (tagged) before the
+/// - Insert races with rebuild: the child pointer is *frozen* (tagged) before the
 ///   snapshot, so new inserts spin-wait until the rebuild completes. In-flight
 ///   inserts (threads that loaded the child pointer before the freeze) may
 ///   complete inside the old subtree; a post-CAS recovery scan detects and
@@ -73,26 +74,26 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
     config: &Config,
     guard: &Guard,
 ) -> bool {
-    let slot = parent_node.slot(parent_slot_idx);
-    let current = slot.load(Ordering::Acquire, guard);
+    let state = parent_node.slot_state(parent_slot_idx);
+    if !is_child(state) {
+        return false;
+    }
 
-    // Null, already frozen by another rebuild, or not a child — bail out.
+    let child_atomic = parent_node.child_atomic(parent_slot_idx);
+    let current = child_atomic.load(Ordering::Acquire, guard);
+
+    // Null or already frozen by another rebuild — bail out.
     if current.is_null() || current.tag() != 0 {
         return false;
     }
 
     // SAFETY: current is not null and valid for the lifetime of the guard.
-    let inner = unsafe { current.deref() };
+    let child = unsafe { current.deref() };
 
-    let child = match inner {
-        SlotInner::Child(child) => child,
-        SlotInner::Data { .. } => return false,
-    };
-
-    // Freeze the slot: tag it so concurrent inserts spin-wait instead of
+    // Freeze the child pointer: tag it so concurrent inserts spin-wait instead of
     // descending into the old subtree during the rebuild.
     let frozen = current.with_tag(1);
-    if slot
+    if child_atomic
         .compare_exchange(current, frozen, Ordering::AcqRel, Ordering::Acquire, guard)
         .is_err()
     {
@@ -101,7 +102,7 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
 
     // RAII: unfreeze on panic or early return.
     let mut freeze_guard = FreezeGuard {
-        slot,
+        slot: child_atomic,
         frozen,
         original: current,
         guard,
@@ -122,12 +123,12 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
     };
 
     let new_node = build::build_recursive(&pairs, &boosted_config);
-    let new_inner = Owned::new(SlotInner::Child(new_node));
+    let new_child = Owned::new(new_node);
 
     // CAS: frozen old → new child.
-    match slot.compare_exchange(
+    match child_atomic.compare_exchange(
         frozen,
-        new_inner,
+        new_child,
         Ordering::AcqRel,
         Ordering::Acquire,
         guard,
@@ -156,7 +157,7 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
             true
         }
         Err(_) => {
-            // FreezeGuard::drop unfreezes the slot.
+            // FreezeGuard::drop unfreezes the child pointer.
             false
         }
     }
@@ -168,6 +169,7 @@ mod tests {
     use crate::insert;
     use crate::lookup;
     use crate::model::LinearModel;
+    use crate::node::SLOT_DATA;
 
     use crossbeam_epoch as epoch;
 
@@ -200,14 +202,10 @@ mod tests {
         // Find a child slot and rebuild it
         let mut rebuilt = false;
         for idx in 0..root.capacity() {
-            let shared = root.slot(idx).load(Ordering::Acquire, &g);
-            if !shared.is_null() {
-                // SAFETY: shared is not null and valid under guard.
-                if let SlotInner::Child(_) = unsafe { shared.deref() } {
-                    rebuilt = try_rebuild_subtree(&root, idx, &config, &g);
-                    if rebuilt {
-                        break;
-                    }
+            if is_child(root.slot_state(idx)) {
+                rebuilt = try_rebuild_subtree(&root, idx, &config, &g);
+                if rebuilt {
+                    break;
                 }
             }
         }
@@ -235,12 +233,8 @@ mod tests {
 
         // Rebuild all child subtrees
         for idx in 0..root.capacity() {
-            let shared = root.slot(idx).load(Ordering::Acquire, &g);
-            if !shared.is_null() {
-                // SAFETY: shared is not null and valid under guard.
-                if let SlotInner::Child(_) = unsafe { shared.deref() } {
-                    try_rebuild_subtree(&root, idx, &config, &g);
-                }
+            if is_child(root.slot_state(idx)) {
+                try_rebuild_subtree(&root, idx, &config, &g);
             }
         }
 
@@ -265,13 +259,9 @@ mod tests {
 
         // Find a data slot and try to rebuild it -- should return false
         for idx in 0..root.capacity() {
-            let shared = root.slot(idx).load(Ordering::Acquire, &g);
-            if !shared.is_null() {
-                // SAFETY: shared is not null and valid under guard.
-                if let SlotInner::Data { .. } = unsafe { shared.deref() } {
-                    assert!(!try_rebuild_subtree(&root, idx, &config, &g));
-                    return;
-                }
+            if root.slot_state(idx) == SLOT_DATA {
+                assert!(!try_rebuild_subtree(&root, idx, &config, &g));
+                return;
             }
         }
         panic!("no data slot found");
@@ -285,7 +275,7 @@ mod tests {
         // Create a parent with an empty child node
         let empty_child = Node::<u64, u64>::with_capacity(LinearModel::new(0.1, 0.0), 4);
         let parent = Node::<u64, u64>::with_capacity(LinearModel::new(0.1, 0.0), 4);
-        parent.store_slot(0, SlotInner::Child(empty_child));
+        parent.store_child(0, empty_child);
 
         // Rebuild should return false (empty subtree)
         assert!(!try_rebuild_subtree(&parent, 0, &config, &g));
