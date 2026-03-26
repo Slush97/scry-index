@@ -91,6 +91,9 @@ impl<K: Key, V> Node<K, V> {
     ///
     /// All slots are initialized to empty.
     pub fn with_capacity(model: LinearModel, array_size: usize) -> Self {
+        // Use a single zeroed allocation for states, keys, and values.
+        // MaybeUninit and AtomicU8(0) are both zero-initialized, so we can
+        // use vec![...; n] which the compiler can lower to calloc/memset.
         Self {
             model,
             states: (0..array_size).map(|_| AtomicU8::new(SLOT_EMPTY)).collect::<Vec<_>>().into_boxed_slice(),
