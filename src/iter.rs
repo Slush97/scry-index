@@ -6,7 +6,7 @@ use std::ops::{Bound, RangeBounds};
 use crossbeam_epoch::Guard;
 
 use crate::key::Key;
-use crate::node::{is_child, Node, SLOT_DATA};
+use crate::node::{is_child, Node, SLOT_DATA, SLOT_WRITING};
 
 /// An iterator over the key-value pairs in a learned index in sorted order.
 ///
@@ -77,7 +77,14 @@ impl<'g, K: Key, V> Iterator for Iter<'g, K, V> {
                         self.stack.push((child, 0));
                     }
                 }
-                _ => continue, // EMPTY, WRITING, TOMBSTONE
+                SLOT_WRITING => {
+                    // A concurrent insert is claiming this slot. Spin briefly
+                    // so rebuild snapshots don't miss in-flight writes.
+                    *slot_idx -= 1; // re-visit this slot
+                    std::hint::spin_loop();
+                    continue;
+                }
+                _ => continue, // EMPTY, TOMBSTONE
             }
         }
     }
@@ -237,7 +244,14 @@ impl<'g, K: Key, V> Iterator for Range<'g, K, V> {
                         self.stack.push((child, 0));
                     }
                 }
-                _ => continue, // EMPTY, WRITING, TOMBSTONE
+                SLOT_WRITING => {
+                    // A concurrent insert is claiming this slot. Spin briefly
+                    // so rebuild snapshots don't miss in-flight writes.
+                    *slot_idx -= 1; // re-visit this slot
+                    std::hint::spin_loop();
+                    continue;
+                }
+                _ => continue, // EMPTY, TOMBSTONE
             }
         }
     }
