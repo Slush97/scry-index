@@ -463,7 +463,10 @@ mod tests {
         // for identical byte content.
         let s = "hello".to_string();
         let arr: [u8; 5] = *b"hello";
-        assert_eq!(s.to_model_input(), arr.to_model_input());
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(s.to_model_input(), arr.to_model_input());
+        }
         assert_eq!(s.to_exact_ordinal(), arr.to_exact_ordinal());
     }
 
@@ -479,14 +482,7 @@ mod tests {
 
     #[test]
     fn vec_u8_model_input_monotonic() {
-        let keys: Vec<Vec<u8>> = vec![
-            vec![],
-            vec![0],
-            vec![0, 1],
-            vec![1],
-            vec![1, 0],
-            vec![255],
-        ];
+        let keys: Vec<Vec<u8>> = vec![vec![], vec![0], vec![0, 1], vec![1], vec![1, 0], vec![255]];
         for pair in keys.windows(2) {
             assert!(
                 pair[0].to_model_input() <= pair[1].to_model_input(),

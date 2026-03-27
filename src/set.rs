@@ -163,7 +163,10 @@ impl<K> serde::Serialize for LearnedSet<K>
 where
     K: Key + serde::Serialize,
 {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
 
         let guard = self.guard();
@@ -181,7 +184,9 @@ impl<'de, K> serde::Deserialize<'de> for LearnedSet<K>
 where
     K: Key + serde::Deserialize<'de>,
 {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         let keys: Vec<K> = Vec::deserialize(deserializer)?;
         if keys.is_empty() {
             return Ok(Self::new());

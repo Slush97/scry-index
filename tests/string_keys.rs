@@ -80,11 +80,7 @@ fn shared_8byte_prefix_same_model_input() {
     assert_eq!(map.len(), 20);
     for i in 0..20u32 {
         let key = format!("{prefix}{i:04}");
-        assert_eq!(
-            map.get(&key, &guard),
-            Some(&i),
-            "key {key:?} not found"
-        );
+        assert_eq!(map.get(&key, &guard), Some(&i), "key {key:?} not found");
     }
 }
 
@@ -127,11 +123,7 @@ fn shared_long_prefix_many_keys() {
     assert_eq!(map.len(), 100);
     for i in 0..100u32 {
         let key = format!("{prefix}{i:06}");
-        assert_eq!(
-            map.get(&key, &guard),
-            Some(&i),
-            "key {key:?} not found"
-        );
+        assert_eq!(map.get(&key, &guard), Some(&i), "key {key:?} not found");
     }
 }
 
@@ -141,9 +133,7 @@ fn shared_long_prefix_many_keys() {
 
 #[test]
 fn string_bulk_load() {
-    let mut pairs: Vec<(String, usize)> = (0..100)
-        .map(|i| (format!("key_{i:04}"), i))
-        .collect();
+    let mut pairs: Vec<(String, usize)> = (0..100).map(|i| (format!("key_{i:04}"), i)).collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let map = LearnedMap::bulk_load(&pairs).unwrap();
@@ -159,9 +149,7 @@ fn string_bulk_load() {
 fn string_bulk_load_shared_prefix() {
     // Bulk load strings that share a long prefix.
     let prefix = "0123456789abcdef_long_prefix_";
-    let mut pairs: Vec<(String, usize)> = (0..50)
-        .map(|i| (format!("{prefix}{i:04}"), i))
-        .collect();
+    let mut pairs: Vec<(String, usize)> = (0..50).map(|i| (format!("{prefix}{i:04}"), i)).collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let map = LearnedMap::bulk_load(&pairs).unwrap();
@@ -179,9 +167,7 @@ fn string_bulk_load_shared_prefix() {
 
 #[test]
 fn string_range_queries() {
-    let mut pairs: Vec<(String, usize)> = (0..100)
-        .map(|i| (format!("item_{i:04}"), i))
-        .collect();
+    let mut pairs: Vec<(String, usize)> = (0..100).map(|i| (format!("item_{i:04}"), i)).collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let map = LearnedMap::bulk_load(&pairs).unwrap();
@@ -259,7 +245,11 @@ fn string_rebuild() {
 
     for i in 0..50u32 {
         let key = format!("key_{i:04}");
-        assert_eq!(map.get(&key, &guard), Some(&i), "key {key:?} lost after rebuild");
+        assert_eq!(
+            map.get(&key, &guard),
+            Some(&i),
+            "key {key:?} lost after rebuild"
+        );
     }
 }
 
@@ -395,9 +385,7 @@ fn vec_u8_insert_get_roundtrip() {
 
 #[test]
 fn vec_u8_bulk_load() {
-    let mut pairs: Vec<(Vec<u8>, usize)> = (0..50u8)
-        .map(|i| (vec![0, 0, i], i as usize))
-        .collect();
+    let mut pairs: Vec<(Vec<u8>, usize)> = (0..50u8).map(|i| (vec![0, 0, i], i as usize)).collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let map = LearnedMap::bulk_load(&pairs).unwrap();
@@ -419,9 +407,7 @@ fn string_matches_btreemap() {
     let guard = map.guard();
 
     // Insert phase
-    let keys: Vec<String> = (0..200)
-        .map(|i| format!("key_{i:05}"))
-        .collect();
+    let keys: Vec<String> = (0..200).map(|i| format!("key_{i:05}")).collect();
 
     for (i, k) in keys.iter().enumerate() {
         map.insert(k.clone(), i, &guard);
@@ -469,11 +455,7 @@ fn string_matches_btreemap_shared_prefix() {
     }
 
     for (k, v) in &btree {
-        assert_eq!(
-            map.get(k, &guard),
-            Some(v),
-            "mismatch for {k:?}"
-        );
+        assert_eq!(map.get(k, &guard), Some(v), "mismatch for {k:?}");
     }
 
     // Iteration order must match BTreeMap
@@ -526,9 +508,7 @@ fn empty_string_key() {
 #[test]
 fn string_bulk_load_with_config() {
     let config = Config::new().expansion_factor(3.0);
-    let mut pairs: Vec<(String, usize)> = (0..50)
-        .map(|i| (format!("item_{i:04}"), i))
-        .collect();
+    let mut pairs: Vec<(String, usize)> = (0..50).map(|i| (format!("item_{i:04}"), i)).collect();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
     let map = LearnedMap::bulk_load_with_config(&pairs, config).unwrap();

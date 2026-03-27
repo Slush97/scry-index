@@ -63,11 +63,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
         // rebuild replaced the subtree after our insert completed.
         // Tuple: (parent_node, slot_idx, child_shared).
         #[allow(clippy::type_complexity)]
-        let mut descent_snapshot: Option<(
-            &Node<K, V>,
-            usize,
-            Shared<'_, Node<K, V>>,
-        )> = None;
+        let mut descent_snapshot: Option<(&Node<K, V>, usize, Shared<'_, Node<K, V>>)> = None;
 
         loop {
             let slot_idx = current_node.predict_slot(&key);
@@ -242,11 +238,7 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
         let mut depth: usize = 0;
         let mut rebuild_candidate: Option<(&'g Node<K, V>, usize)> = None;
         #[allow(clippy::type_complexity)]
-        let mut descent_snapshot: Option<(
-            &'g Node<K, V>,
-            usize,
-            Shared<'g, Node<K, V>>,
-        )> = None;
+        let mut descent_snapshot: Option<(&'g Node<K, V>, usize, Shared<'g, Node<K, V>>)> = None;
 
         loop {
             let slot_idx = current_node.predict_slot(&key);
@@ -388,10 +380,7 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
 ///
 /// Used when updating an existing key: the new value goes into a child node
 /// so the parent slot can be CAS'd from `DATA` → `CHILD_STALE`.
-fn build_single_entry_child<K: Key, V: Clone + Send + Sync>(
-    key: &K,
-    value: V,
-) -> Node<K, V> {
+fn build_single_entry_child<K: Key, V: Clone + Send + Sync>(key: &K, value: V) -> Node<K, V> {
     let f = key.to_model_input();
     let node = Node::with_capacity(LinearModel::new(1.0, -f), 2);
     let slot = node.predict_slot(key);

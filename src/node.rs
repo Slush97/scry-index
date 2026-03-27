@@ -5,7 +5,7 @@
 //! allocation), with child pointers in a separate array for conflict chains.
 //!
 //! Slot states are tracked via per-slot [`AtomicU8`] bytes:
-//! - [`SLOT_EMPTY`]: unused
+//! - [`SLOT_EMPTY`][]: unused
 //! - [`SLOT_WRITING`]: being claimed by a concurrent insert (transient)
 //! - [`SLOT_DATA`]: contains an inline key-value pair (immutable once published)
 //! - [`SLOT_CHILD`]: contains a child node pointer (no inline data)
@@ -23,6 +23,9 @@ use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 
 use crate::key::Key;
 use crate::model::LinearModel;
+
+/// Lazily-initialized array of epoch-protected child pointers.
+type ChildArray<K, V> = OnceLock<Box<[Atomic<Node<K, V>>]>>;
 
 /// Slot is unused — no inline data, no child.
 pub const SLOT_EMPTY: u8 = 0;
@@ -61,14 +64,14 @@ pub struct Node<K, V> {
     model: LinearModel,
     /// Per-slot state byte (see `SLOT_*` constants).
     states: Box<[AtomicU8]>,
-    /// Inline key storage. Valid when state is DATA, CHILD_STALE, or TOMBSTONE.
+    /// Inline key storage. Valid when state is DATA, `CHILD_STALE`, or TOMBSTONE.
     keys: Box<[UnsafeCell<MaybeUninit<K>>]>,
-    /// Inline value storage. Valid when state is DATA, CHILD_STALE, or TOMBSTONE.
+    /// Inline value storage. Valid when state is DATA, `CHILD_STALE`, or TOMBSTONE.
     values: Box<[UnsafeCell<MaybeUninit<V>>]>,
-    /// Child node pointers. Valid when state is CHILD or CHILD_STALE.
+    /// Child node pointers. Valid when state is CHILD or `CHILD_STALE`.
     /// Lazily initialized via [`OnceLock`] to avoid allocating a large array
     /// for zero-conflict bulk-loaded nodes that never need children.
-    children: OnceLock<Box<[Atomic<Node<K, V>>]>>,
+    children: ChildArray<K, V>,
     /// Approximate number of data entries in this node (not counting children).
     num_keys: AtomicUsize,
     /// Approximate number of tombstones in this node.
@@ -83,9 +86,12 @@ impl<K, V> std::fmt::Debug for Node<K, V> {
             .field("model", &self.model)
             .field("capacity", &self.states.len())
             .field("num_keys", &self.num_keys.load(Ordering::Relaxed))
-            .field("num_tombstones", &self.num_tombstones.load(Ordering::Relaxed))
+            .field(
+                "num_tombstones",
+                &self.num_tombstones.load(Ordering::Relaxed),
+            )
             .field("has_split_key", &self.split_key.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -110,9 +116,18 @@ impl<K: Key, V> Node<K, V> {
         );
         Self {
             model,
-            states: (0..array_size).map(|_| AtomicU8::new(SLOT_EMPTY)).collect::<Vec<_>>().into_boxed_slice(),
-            keys: (0..array_size).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect::<Vec<_>>().into_boxed_slice(),
-            values: (0..array_size).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect::<Vec<_>>().into_boxed_slice(),
+            states: (0..array_size)
+                .map(|_| AtomicU8::new(SLOT_EMPTY))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            keys: (0..array_size)
+                .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            values: (0..array_size)
+                .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             children,
             num_keys: AtomicUsize::new(0),
             num_tombstones: AtomicUsize::new(0),
@@ -132,9 +147,18 @@ impl<K: Key, V> Node<K, V> {
     pub fn with_capacity_leaf(model: LinearModel, array_size: usize) -> Self {
         Self {
             model,
-            states: (0..array_size).map(|_| AtomicU8::new(SLOT_EMPTY)).collect::<Vec<_>>().into_boxed_slice(),
-            keys: (0..array_size).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect::<Vec<_>>().into_boxed_slice(),
-            values: (0..array_size).map(|_| UnsafeCell::new(MaybeUninit::uninit())).collect::<Vec<_>>().into_boxed_slice(),
+            states: (0..array_size)
+                .map(|_| AtomicU8::new(SLOT_EMPTY))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            keys: (0..array_size)
+                .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            values: (0..array_size)
+                .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             children: OnceLock::new(),
             num_keys: AtomicUsize::new(0),
             num_tombstones: AtomicUsize::new(0),
@@ -181,7 +205,7 @@ impl<K: Key, V> Node<K, V> {
     /// pointers. Subsequent calls return the same array. Thread-safe via
     /// [`OnceLock`].
     #[inline]
-    fn ensure_children(&self) -> &[Atomic<Node<K, V>>] {
+    fn ensure_children(&self) -> &[Atomic<Self>] {
         self.children.get_or_init(|| {
             let cap = self.states.len();
             (0..cap)
@@ -215,7 +239,7 @@ impl<K: Key, V> Node<K, V> {
     ///
     /// The slot must be empty. No inline data is written. Lazily allocates
     /// the children array if this is the first child stored.
-    pub fn store_child(&self, idx: usize, child: Node<K, V>) {
+    pub fn store_child(&self, idx: usize, child: Self) {
         debug_assert_eq!(
             self.states[idx].load(Ordering::Relaxed),
             SLOT_EMPTY,
@@ -243,7 +267,7 @@ impl<K: Key, V> Node<K, V> {
     ///
     /// # Safety
     ///
-    /// Caller must ensure the slot has inline data (state is DATA, CHILD_STALE,
+    /// Caller must ensure the slot has inline data (state is DATA, `CHILD_STALE`,
     /// or TOMBSTONE) and that the data will not be concurrently modified.
     #[inline]
     pub unsafe fn read_key(&self, idx: usize) -> &K {
@@ -270,18 +294,19 @@ impl<K: Key, V> Node<K, V> {
         &self,
         idx: usize,
         guard: &'g Guard,
-    ) -> crossbeam_epoch::Shared<'g, Node<K, V>> {
-        match self.children.get() {
-            Some(children) => children[idx].load(Ordering::Acquire, guard),
-            None => crossbeam_epoch::Shared::null(),
-        }
+    ) -> crossbeam_epoch::Shared<'g, Self> {
+        self.children
+            .get()
+            .map_or_else(crossbeam_epoch::Shared::null, |children| {
+                children[idx].load(Ordering::Acquire, guard)
+            })
     }
 
     /// Get a reference to the child's [`Atomic`] for CAS operations (freeze, etc.).
     ///
     /// Lazily allocates the children array if it has not been initialized.
     #[inline]
-    pub fn child_atomic(&self, idx: usize) -> &Atomic<Node<K, V>> {
+    pub fn child_atomic(&self, idx: usize) -> &Atomic<Self> {
         &self.ensure_children()[idx]
     }
 
@@ -302,7 +327,12 @@ impl<K: Key, V> Node<K, V> {
     pub fn cas_empty_to_data(&self, idx: usize, key: K, value: V) -> bool {
         // CAS EMPTY → WRITING to claim exclusive write access to this slot.
         if self.states[idx]
-            .compare_exchange(SLOT_EMPTY, SLOT_WRITING, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                SLOT_EMPTY,
+                SLOT_WRITING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_err()
         {
             return false;
@@ -343,18 +373,13 @@ impl<K: Key, V> Node<K, V> {
         true
     }
 
-    /// Transition a DATA slot to a CHILD_STALE slot with the given child node.
+    /// Transition a DATA slot to a `CHILD_STALE` slot with the given child node.
     ///
     /// Clones the existing inline key+value (for the child to use), then stores
     /// the child pointer and transitions the state. The inline data becomes stale.
     ///
     /// Returns `true` on success, `false` if the slot was no longer DATA.
-    pub fn cas_data_to_child_stale(
-        &self,
-        idx: usize,
-        child: Node<K, V>,
-        guard: &Guard,
-    ) -> bool {
+    pub fn cas_data_to_child_stale(&self, idx: usize, child: Self, guard: &Guard) -> bool {
         if self.states[idx]
             .compare_exchange(SLOT_DATA, SLOT_WRITING, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
@@ -493,9 +518,8 @@ impl<K, V> Drop for Node<K, V> {
             for i in 0..self.states.len() {
                 let state = *self.states[i].get_mut();
                 // Drop inline data if it was initialized.
-                let has_inline = state == SLOT_DATA
-                    || state == SLOT_CHILD_STALE
-                    || state == SLOT_TOMBSTONE;
+                let has_inline =
+                    state == SLOT_DATA || state == SLOT_CHILD_STALE || state == SLOT_TOMBSTONE;
                 if has_inline && std::mem::needs_drop::<K>() {
                     std::ptr::drop_in_place((*self.keys[i].get()).as_mut_ptr());
                 }

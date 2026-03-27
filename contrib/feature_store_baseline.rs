@@ -9,6 +9,7 @@
 //! ```sh
 //! cargo run --example feature_store_baseline --release
 //! ```
+#![allow(clippy::too_many_lines)]
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
@@ -44,7 +45,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     let mut user_features: Vec<Vec<f64>> = Vec::with_capacity(N_USERS);
-    let mut columns: Vec<Vec<f64>> = vec![Vec::with_capacity(N_USERS); N_FEATURES];
+    let mut columns: Vec<Vec<f64>> = (0..N_FEATURES)
+        .map(|_| Vec::with_capacity(N_USERS))
+        .collect();
 
     for _ in 0..N_USERS {
         let row: Vec<f64> = (0..N_FEATURES).map(|_| rng.gen::<f64>()).collect();
@@ -59,11 +62,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|feats| {
             let score: f64 = feats.iter().zip(weights.iter()).map(|(f, w)| f * w).sum();
-            if score > 0.35 { 1.0 } else { 0.0 }
+            if score > 0.35 {
+                1.0
+            } else {
+                0.0
+            }
         })
         .collect();
 
-    let n_positive = target.iter().filter(|&&t| t == 1.0).count();
+    let n_positive = target
+        .iter()
+        .filter(|&&t| (t - 1.0).abs() < f64::EPSILON)
+        .count();
     println!(
         "Generated {N_USERS} users, {N_FEATURES} features, {:.1}% positive class",
         n_positive as f64 / N_USERS as f64 * 100.0
@@ -71,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Phase 2: Train classifier (identical) ──────────────────────────
 
-    let dataset = Dataset::new(columns, target.clone(), feature_names, "will_convert");
+    let dataset = Dataset::new(columns, target, feature_names, "will_convert");
 
     let mut model = RandomForestClassifier::new()
         .n_estimators(20)
@@ -80,10 +90,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let train_start = Instant::now();
     model.fit(&dataset)?;
-    println!("Trained RandomForest (20 trees, depth 6) in {:?}", train_start.elapsed());
+    println!(
+        "Trained RandomForest (20 trees, depth 6) in {:?}",
+        train_start.elapsed()
+    );
 
     let preds = model.predict(&dataset.feature_matrix())?;
-    println!("Training accuracy: {:.4}", accuracy(&dataset.target, &preds));
+    println!(
+        "Training accuracy: {:.4}",
+        accuracy(&dataset.target, &preds)
+    );
 
     // ── Phase 3a: Build HashMap store ──────────────────────────────────
 
@@ -132,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     if let Some(features) = features {
                         let pred = model.predict(&[features]).unwrap();
-                        if pred[0] == 1.0 {
+                        if (pred[0] - 1.0).abs() < f64::EPSILON {
                             positive += 1;
                         }
                         served += 1;
@@ -181,7 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     if let Some(features) = features {
                         let pred = model.predict(&[features]).unwrap();
-                        if pred[0] == 1.0 {
+                        if (pred[0] - 1.0).abs() < f64::EPSILON {
                             positive += 1;
                         }
                         served += 1;
@@ -216,15 +232,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HashMap: no range support — must filter all keys
     let range_start = Instant::now();
     let hashmap_guard = hashmap.read().unwrap();
-    let hash_range: Vec<_> = hashmap_guard
+    let hash_range_count = hashmap_guard
         .iter()
         .filter(|(&k, _)| (1000..1100).contains(&k))
-        .collect();
+        .count();
     let hash_range_time = range_start.elapsed();
     println!(
-        "HashMap  scan [1000..1100]: {} users in {:?} (full scan, no sorted order)",
-        hash_range.len(),
-        hash_range_time,
+        "HashMap  scan [1000..1100]: {hash_range_count} users in {hash_range_time:?} (full scan, no sorted order)",
     );
     drop(hashmap_guard);
 
@@ -247,17 +261,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Batch predict on the BTreeMap range
     let batch_features: Vec<Vec<f64>> = btree_range.iter().map(|(_, v)| v.clone()).collect();
     let batch_preds = model.predict(&batch_features)?;
-    let batch_positive = batch_preds.iter().filter(|&&p| p == 1.0).count();
-    println!("  {batch_positive}/{} predicted to convert", btree_range.len());
+    let batch_positive = batch_preds
+        .iter()
+        .filter(|&&p| (p - 1.0).abs() < f64::EPSILON)
+        .count();
+    println!(
+        "  {batch_positive}/{} predicted to convert",
+        btree_range.len()
+    );
 
     // ── Summary ────────────────────────────────────────────────────────
 
     println!("\n=== Summary ===");
     println!("HashMap + RwLock:  {hashmap_throughput:>12.0} pred/sec");
     println!("BTreeMap + RwLock: {btree_throughput:>12.0} pred/sec");
-    println!(
-        "\nNote: RwLock allows concurrent reads but blocks all readers on write."
-    );
+    println!("\nNote: RwLock allows concurrent reads but blocks all readers on write.");
     println!("Run `cargo run --example feature_store --release` to compare with scry-index.");
 
     Ok(())

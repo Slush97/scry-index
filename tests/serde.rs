@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 #![cfg(feature = "serde")]
 
 use scry_index::{Config, Error, LearnedMap, LearnedSet};

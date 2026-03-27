@@ -20,7 +20,7 @@ fn main() {
 
     println!("get(20) = {:?}", m.get(&20)); // Some(&"twenty")
     println!("get(99) = {:?}", m.get(&99)); // None
-    println!("len     = {}", m.len());      // 4
+    println!("len     = {}", m.len()); // 4
 
     // Update an existing key
     m.insert(10u64, "TEN");
@@ -64,7 +64,7 @@ fn main() {
     println!("\nget_or_insert(42) = {inserted:?}"); // "new"
 
     let existing = m.get_or_insert(42u64, "ignored");
-    println!("get_or_insert(42) = {existing:?}");   // "new" (not replaced)
+    println!("get_or_insert(42) = {existing:?}"); // "new" (not replaced)
 
     // ── Custom configuration ─────────────────────────────────────────────
 
@@ -97,7 +97,10 @@ fn main() {
     n.insert("bob".to_string(), 25);
     n.insert("charlie".to_string(), 35);
 
-    println!("\nString key lookup: alice = {:?}", n.get(&"alice".to_string()));
+    println!(
+        "\nString key lookup: alice = {:?}",
+        n.get(&"alice".to_string())
+    );
     println!("Sorted names:");
     for (name, age) in n.iter() {
         println!("  {name}: {age}");

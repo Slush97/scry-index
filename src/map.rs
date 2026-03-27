@@ -480,13 +480,8 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             }
             // SAFETY: root is always non-null.
             let root = unsafe { root_shared.deref() };
-            let (val, result) = insert::get_or_insert(
-                root,
-                key.clone(),
-                &value,
-                &self.config,
-                &guard.inner,
-            );
+            let (val, result) =
+                insert::get_or_insert(root, key.clone(), &value, &self.config, &guard.inner);
             // Validate: root wasn't replaced or frozen by a concurrent rebuild.
             if self.root.load(Ordering::Acquire, &guard.inner) != root_shared {
                 if result == InsertResult::Inserted {
@@ -508,12 +503,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// Like [`get_or_insert`](Self::get_or_insert), but the value is lazily
     /// computed by `f` only if the key is absent. If the key is present, `f`
     /// is never called.
-    pub fn get_or_insert_with<'g>(
-        &self,
-        key: K,
-        f: impl FnOnce() -> V,
-        guard: &'g Guard,
-    ) -> &'g V {
+    pub fn get_or_insert_with<'g>(&self, key: K, f: impl FnOnce() -> V, guard: &'g Guard) -> &'g V {
         // Fast path: key already exists.
         if let Some(val) = self.get(&key, guard) {
             return val;
@@ -860,7 +850,10 @@ where
     K: Key + serde::Serialize,
     V: Clone + Send + Sync + serde::Serialize,
 {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeSeq;
 
         let guard = self.guard();
@@ -879,7 +872,9 @@ where
     K: Key + serde::Deserialize<'de>,
     V: Clone + Send + Sync + serde::Deserialize<'de>,
 {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         let pairs: Vec<(K, V)> = Vec::deserialize(deserializer)?;
         if pairs.is_empty() {
             return Ok(Self::new());

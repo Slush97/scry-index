@@ -82,9 +82,8 @@ impl<'g, K: Key, V> Iterator for Iter<'g, K, V> {
                     // so rebuild snapshots don't miss in-flight writes.
                     *slot_idx -= 1; // re-visit this slot
                     std::hint::spin_loop();
-                    continue;
                 }
-                _ => continue, // EMPTY, TOMBSTONE
+                _ => {} // EMPTY, TOMBSTONE
             }
         }
     }
@@ -249,9 +248,8 @@ impl<'g, K: Key, V> Iterator for Range<'g, K, V> {
                     // so rebuild snapshots don't miss in-flight writes.
                     *slot_idx -= 1; // re-visit this slot
                     std::hint::spin_loop();
-                    continue;
                 }
-                _ => continue, // EMPTY, TOMBSTONE
+                _ => {} // EMPTY, TOMBSTONE
             }
         }
     }
@@ -291,7 +289,7 @@ pub fn last_entry<'g, K: Key, V>(root: &'g Node<K, V>, guard: &'g Guard) -> Opti
                         break;
                     }
                 }
-                _ => continue,
+                _ => {}
             }
         }
         node = child_found?;

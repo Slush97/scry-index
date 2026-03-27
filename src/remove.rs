@@ -39,11 +39,7 @@ pub fn remove<K: Key, V: Clone + Send + Sync>(
         // Track the first child descent so we can detect if a concurrent
         // rebuild replaced the subtree after our remove completed.
         #[allow(clippy::type_complexity)]
-        let mut descent_snapshot: Option<(
-            &Node<K, V>,
-            usize,
-            Shared<'_, Node<K, V>>,
-        )> = None;
+        let mut descent_snapshot: Option<(&Node<K, V>, usize, Shared<'_, Node<K, V>>)> = None;
 
         loop {
             let slot_idx = current_node.predict_slot(key);
@@ -53,7 +49,6 @@ pub fn remove<K: Key, V: Clone + Send + Sync>(
                 SLOT_EMPTY | SLOT_TOMBSTONE => return was_removed,
                 SLOT_WRITING => {
                     std::hint::spin_loop();
-                    continue;
                 }
                 SLOT_DATA => {
                     // SAFETY: state is DATA, so the key slot is initialized.
@@ -79,13 +74,10 @@ pub fn remove<K: Key, V: Clone + Send + Sync>(
                         // Tombstone compaction: if the ratio exceeds threshold,
                         // trigger a localized subtree rebuild.
                         if config.auto_rebuild
-                            && current_node.tombstone_ratio()
-                                > config.tombstone_ratio_threshold
+                            && current_node.tombstone_ratio() > config.tombstone_ratio_threshold
                         {
                             if let Some((parent, idx)) = rebuild_candidate {
-                                crate::rebuild::try_rebuild_subtree(
-                                    parent, idx, config, guard,
-                                );
+                                crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
                             }
                         }
 
@@ -220,11 +212,10 @@ mod tests {
     #[test]
     fn tombstone_compaction_preserves_remaining_keys() {
         let g = guard();
-        let c = Config::new().auto_rebuild(true).tombstone_ratio_threshold(0.3);
-        let root = Node::<u64, u64>::with_capacity(
-            crate::model::LinearModel::new(0.01, 0.0),
-            16,
-        );
+        let c = Config::new()
+            .auto_rebuild(true)
+            .tombstone_ratio_threshold(0.3);
+        let root = Node::<u64, u64>::with_capacity(crate::model::LinearModel::new(0.01, 0.0), 16);
         // Insert keys that create child subtrees
         for i in 0..40u64 {
             insert::insert(&root, i, &i, &c, &g);

@@ -5,13 +5,14 @@
 //! Pipeline:
 //! 1. Generate synthetic user data (10K users, 5 features)
 //! 2. Train a Random Forest classifier with scry-learn
-//! 3. Bulk-load user features into a LearnedMap
+//! 3. Bulk-load user features into a `LearnedMap`
 //! 4. Serve predictions from 8 threads concurrently
 //!
 //! Run with:
 //! ```sh
 //! cargo run --example feature_store --release
 //! ```
+#![allow(clippy::too_many_lines)]
 
 use std::sync::Arc;
 use std::thread;
@@ -59,7 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Generate row-major (for scry-index storage) and column-major (for scry-learn)
     let mut user_features: Vec<Vec<f64>> = Vec::with_capacity(N_USERS);
-    let mut columns: Vec<Vec<f64>> = vec![Vec::with_capacity(N_USERS); N_FEATURES];
+    let mut columns: Vec<Vec<f64>> = (0..N_FEATURES)
+        .map(|_| Vec::with_capacity(N_USERS))
+        .collect();
 
     for _ in 0..N_USERS {
         let row: Vec<f64> = (0..N_FEATURES).map(|_| rng.gen::<f64>()).collect();
@@ -76,11 +79,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|feats| {
             let score: f64 = feats.iter().zip(weights.iter()).map(|(f, w)| f * w).sum();
-            if score > 0.35 { 1.0 } else { 0.0 }
+            if score > 0.35 {
+                1.0
+            } else {
+                0.0
+            }
         })
         .collect();
 
-    let n_positive = target.iter().filter(|&&t| t == 1.0).count();
+    let n_positive = target
+        .iter()
+        .filter(|&&t| (t - 1.0).abs() < f64::EPSILON)
+        .count();
     println!(
         "Generated {N_USERS} users, {N_FEATURES} features, {:.1}% positive class",
         n_positive as f64 / N_USERS as f64 * 100.0
@@ -88,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Phase 2: Train classifier ──────────────────────────────────────
 
-    let dataset = Dataset::new(columns, target.clone(), feature_names, "will_convert");
+    let dataset = Dataset::new(columns, target, feature_names, "will_convert");
 
     let mut model = RandomForestClassifier::new()
         .n_estimators(20)
@@ -97,10 +107,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let train_start = Instant::now();
     model.fit(&dataset)?;
-    println!("Trained RandomForest (20 trees, depth 6) in {:?}", train_start.elapsed());
+    println!(
+        "Trained RandomForest (20 trees, depth 6) in {:?}",
+        train_start.elapsed()
+    );
 
     let preds = model.predict(&dataset.feature_matrix())?;
-    println!("Training accuracy: {:.4}", accuracy(&dataset.target, &preds));
+    println!(
+        "Training accuracy: {:.4}",
+        accuracy(&dataset.target, &preds)
+    );
 
     // ── Phase 3: Build feature store ───────────────────────────────────
     //
@@ -152,8 +168,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for i in 0..REQUESTS_PER_THREAD {
                     let user_id = ((t * REQUESTS_PER_THREAD + i) % N_USERS) as u64;
                     if let Some(features) = map.get(&user_id) {
-                        let pred = model.predict(&[features.clone()]).unwrap();
-                        if pred[0] == 1.0 {
+                        let pred = model.predict(std::slice::from_ref(features)).unwrap();
+                        if (pred[0] - 1.0).abs() < f64::EPSILON {
                             positive += 1;
                         }
                         served += 1;
@@ -193,10 +209,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Point lookup
     if let Some(feats) = store.get(&42, &guard) {
-        let pred = model.predict(&[feats.clone()])?;
-        let label = if pred[0] == 1.0 { "will convert" } else { "won't convert" };
+        let pred = model.predict(std::slice::from_ref(feats))?;
+        let label = if (pred[0] - 1.0).abs() < f64::EPSILON {
+            "will convert"
+        } else {
+            "won't convert"
+        };
         println!("User 42: {label}");
-        println!("  features: [{}]", feats.iter().map(|f| format!("{f:.3}")).collect::<Vec<_>>().join(", "));
+        println!(
+            "  features: [{}]",
+            feats
+                .iter()
+                .map(|f| format!("{f:.3}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     // Range query: fetch a batch of users for bulk scoring
@@ -212,11 +239,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Batch predict on the range result
     let batch_features: Vec<Vec<f64>> = batch.iter().map(|(_, v)| (*v).clone()).collect();
     let batch_preds = model.predict(&batch_features)?;
-    let batch_positive = batch_preds.iter().filter(|&&p| p == 1.0).count();
-    println!(
-        "  {batch_positive}/{} predicted to convert",
-        batch.len()
-    );
+    let batch_positive = batch_preds
+        .iter()
+        .filter(|&&p| (p - 1.0).abs() < f64::EPSILON)
+        .count();
+    println!("  {batch_positive}/{} predicted to convert", batch.len());
 
     println!("\nDone.");
     Ok(())

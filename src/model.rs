@@ -328,14 +328,14 @@ mod tests {
 
     #[test]
     fn identical_keys_handled() {
-        let keys = vec![5u64; 10];
+        let keys = [5u64; 10];
         let result = fit_fmcd(keys.len(), |i| keys[i].to_model_input(), 2.0, 0.0);
         assert_eq!(result.conflicts, 9);
     }
 
     #[test]
     fn large_key_range() {
-        let keys = vec![0u64, u64::MAX / 2];
+        let keys = [0u64, u64::MAX / 2];
         let result = fit_fmcd(keys.len(), |i| keys[i].to_model_input(), 2.0, 0.0);
         assert_eq!(result.conflicts, 0);
     }
@@ -403,10 +403,18 @@ mod tests {
         let model = LinearModel::binary_split(mid);
 
         for i in 0..=4u64 {
-            assert_eq!(model.predict(&(base + i), 2), 0, "base+{i} should go to slot 0");
+            assert_eq!(
+                model.predict(&(base + i), 2),
+                0,
+                "base+{i} should go to slot 0"
+            );
         }
         for i in 5..10u64 {
-            assert_eq!(model.predict(&(base + i), 2), 1, "base+{i} should go to slot 1");
+            assert_eq!(
+                model.predict(&(base + i), 2),
+                1,
+                "base+{i} should go to slot 1"
+            );
         }
     }
 
@@ -478,6 +486,9 @@ mod tests {
         // still get 0 conflicts after the FMCD rewrite.
         let keys: Vec<u64> = (0..1000).collect();
         let result = fit_fmcd(keys.len(), |i| keys[i].to_model_input(), 2.0, 0.0);
-        assert_eq!(result.conflicts, 0, "sequential keys should have 0 conflicts");
+        assert_eq!(
+            result.conflicts, 0,
+            "sequential keys should have 0 conflicts"
+        );
     }
 }

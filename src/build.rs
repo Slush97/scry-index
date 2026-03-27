@@ -242,11 +242,7 @@ mod tests {
         let node = bulk_load(&pairs, &default_config()).unwrap();
         assert_eq!(node.total_keys(&g), 20);
         for (k, v) in &pairs {
-            assert_eq!(
-                crate::lookup::get(&node, k, &g),
-                Some(v),
-                "missing key {k}"
-            );
+            assert_eq!(crate::lookup::get(&node, k, &g), Some(v), "missing key {k}");
         }
     }
 
@@ -269,11 +265,7 @@ mod tests {
         let node = build_degenerate(&pairs);
         assert_eq!(node.total_keys(&g), 50);
         for (k, v) in &pairs {
-            assert_eq!(
-                crate::lookup::get(&node, k, &g),
-                Some(v),
-                "missing key {k}"
-            );
+            assert_eq!(crate::lookup::get(&node, k, &g), Some(v), "missing key {k}");
         }
     }
 }

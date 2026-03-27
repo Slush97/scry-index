@@ -1,5 +1,5 @@
-//! Quick mini-benchmark for write performance vs BTreeMap.
-//! Run with: cargo run --example mini_bench --release
+//! Quick mini-benchmark for write performance vs `BTreeMap`.
+//! Run with: `cargo run --example mini_bench --release`
 #![allow(clippy::uninlined_format_args, clippy::too_many_lines)]
 
 use std::collections::BTreeMap;
@@ -9,7 +9,7 @@ use std::time::Instant;
 use rand::Rng;
 use scry_index::LearnedMap;
 
-fn median(times: &mut Vec<f64>) -> f64 {
+fn median(times: &mut [f64]) -> f64 {
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mid = times.len() / 2;
     if times.len() % 2 == 0 {
@@ -37,7 +37,11 @@ fn bench<F: FnMut()>(name: &str, iters: usize, mut f: F) -> f64 {
 fn ratio(learned: f64, btree: f64) {
     let r = learned / btree;
     let tag = if r < 1.0 { "FASTER" } else { "slower" };
-    println!("    => learned is {:.2}x {}\n", if r < 1.0 { 1.0 / r } else { r }, tag);
+    println!(
+        "    => learned is {:.2}x {}\n",
+        if r < 1.0 { 1.0 / r } else { r },
+        tag
+    );
 }
 
 fn main() {

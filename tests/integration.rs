@@ -863,7 +863,7 @@ fn incremental_insert_1000_from_empty() {
 fn byte4_insert_get_roundtrip() {
     let map = LearnedMap::new();
     let g = map.guard();
-    let keys: Vec<[u8; 4]> = (0..100u32).map(|i| i.to_be_bytes()).collect();
+    let keys: Vec<[u8; 4]> = (0..100u32).map(u32::to_be_bytes).collect();
     for (i, k) in keys.iter().enumerate() {
         map.insert(*k, i, &g);
     }
@@ -875,9 +875,7 @@ fn byte4_insert_get_roundtrip() {
 
 #[test]
 fn byte8_bulk_load_and_lookup() {
-    let pairs: Vec<([u8; 8], u64)> = (0..200u64)
-        .map(|i| (i.to_be_bytes(), i * 10))
-        .collect();
+    let pairs: Vec<([u8; 8], u64)> = (0..200u64).map(|i| (i.to_be_bytes(), i * 10)).collect();
     let map = LearnedMap::bulk_load(&pairs).unwrap();
     let g = map.guard();
     assert_eq!(map.len(), 200);
@@ -888,10 +886,8 @@ fn byte8_bulk_load_and_lookup() {
 
 #[test]
 fn byte16_iteration_sorted() {
-    let mut keys: Vec<[u8; 16]> = (0..50u128)
-        .map(|i| i.to_be_bytes())
-        .collect();
-    keys.sort();
+    let mut keys: Vec<[u8; 16]> = (0..50u128).map(u128::to_be_bytes).collect();
+    keys.sort_unstable();
     let pairs: Vec<([u8; 16], usize)> = keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
     let map = LearnedMap::bulk_load(&pairs).unwrap();
     let g = map.guard();
@@ -906,11 +902,13 @@ fn byte16_iteration_sorted() {
 fn byte32_insert_remove_cycle() {
     let map = LearnedMap::new();
     let g = map.guard();
-    let keys: Vec<[u8; 32]> = (0..50u8).map(|i| {
-        let mut k = [0u8; 32];
-        k[0] = i;
-        k
-    }).collect();
+    let keys: Vec<[u8; 32]> = (0..50u8)
+        .map(|i| {
+            let mut k = [0u8; 32];
+            k[0] = i;
+            k
+        })
+        .collect();
     for (i, k) in keys.iter().enumerate() {
         map.insert(*k, i, &g);
     }
@@ -934,9 +932,7 @@ fn byte32_insert_remove_cycle() {
 
 #[test]
 fn byte8_range_query() {
-    let pairs: Vec<([u8; 8], u64)> = (0..100u64)
-        .map(|i| (i.to_be_bytes(), i))
-        .collect();
+    let pairs: Vec<([u8; 8], u64)> = (0..100u64).map(|i| (i.to_be_bytes(), i)).collect();
     let map = LearnedMap::bulk_load(&pairs).unwrap();
     let g = map.guard();
     let lo = 10u64.to_be_bytes();
@@ -986,7 +982,7 @@ fn byte16_bulk_load_dedup() {
 
 #[test]
 fn byte_array_set_works() {
-    let keys: Vec<[u8; 8]> = (0..50u64).map(|i| i.to_be_bytes()).collect();
+    let keys: Vec<[u8; 8]> = (0..50u64).map(u64::to_be_bytes).collect();
     let set = LearnedSet::bulk_load(&keys).unwrap();
     let g = set.guard();
     assert_eq!(set.len(), 50);
@@ -1099,10 +1095,14 @@ fn get_or_insert_with_closure_not_called_when_exists() {
     let g = map.guard();
     map.insert(5u64, 50, &g);
     let mut called = false;
-    let val = map.get_or_insert_with(5, || {
-        called = true;
-        999
-    }, &g);
+    let val = map.get_or_insert_with(
+        5,
+        || {
+            called = true;
+            999
+        },
+        &g,
+    );
     assert!(!called);
     assert_eq!(*val, 50);
 }
@@ -1112,10 +1112,14 @@ fn get_or_insert_with_calls_closure_when_absent() {
     let map = LearnedMap::new();
     let g = map.guard();
     let mut called = false;
-    let val = map.get_or_insert_with(5u64, || {
-        called = true;
-        999
-    }, &g);
+    let val = map.get_or_insert_with(
+        5u64,
+        || {
+            called = true;
+            999
+        },
+        &g,
+    );
     assert!(called);
     assert_eq!(*val, 999);
     assert_eq!(map.len(), 1);
