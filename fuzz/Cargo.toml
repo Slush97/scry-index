@@ -1,0 +1,33 @@
+[package]
+name = "scry-index-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.scry-index]
+path = ".."
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_operations"
+path = "fuzz_targets/fuzz_operations.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_bulk_load"
+path = "fuzz_targets/fuzz_bulk_load.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_string_keys"
+path = "fuzz_targets/fuzz_string_keys.rs"
+doc = false

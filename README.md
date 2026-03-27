@@ -27,24 +27,25 @@ for (k, v) in m.range(1u64..50) {
 
 ## Tradeoffs
 
-Read-optimized. Lookups are dramatically faster; inserts are moderately slower
-than `BTreeMap`.
+Read-optimized. Lookups are dramatically faster; writes are competitive for
+sequential and time-series workloads.
 
 | Operation | LearnedMap | BTreeMap | |
 |---|---|---|---|
-| Point lookup (100K, sequential) | 0.99 ms | 6.27 ms | **6.3x faster** |
-| Point lookup (100K, random) | 1.13 ms | 11.94 ms | **10.5x faster** |
-| Point lookup (500K, random) | 11.4 ms | 86.0 ms | **7.5x faster** |
-| Sequential insert (100K) | 14.7 ms | 9.7 ms | 1.5x slower |
-| Bulk load (100K) | 3.5 ms | 1.9 ms | 1.9x slower |
+| Point lookup (100K, sequential) | 1.0 ms | 6.2 ms | **6.2x faster** |
+| Point lookup (100K, random) | 1.2 ms | 11.6 ms | **9.8x faster** |
+| Point lookup (500K, sequential) | 5.0 ms | 32.4 ms | **6.5x faster** |
+| Sequential insert (100K) | 12.4 ms | 12.4 ms | **parity** |
+| Append-only insert (100K) | 8.0 ms | 8.9 ms | **1.1x faster** |
+| Bulk load (100K) | 3.7 ms | 2.0 ms | 1.8x slower |
 
 The O(1) model-predicted lookup vs O(log n) tree walk advantage grows with
 scale and is especially pronounced under random access patterns where
 BTreeMap suffers cache misses.
 
 Good for read-heavy, concurrent workloads with sorted keys (time-series
-queries, lookup tables, analytics indexes). Not the right choice if writes
-dominate.
+queries, lookup tables, analytics indexes). Random-key insert is slower
+(~4-6x) due to model collisions — use bulk loading when possible.
 
 ```sh
 cargo bench                                      # criterion microbenchmarks
@@ -57,10 +58,12 @@ cargo run --example simulate --release           # time-series workload
 - Lock-free reads via epoch-based reclamation
 - CAS-based writes, per-slot contention only
 - Sorted iteration and range queries (`a..b`, `a..=b`, `a..`, `..b`, `..`)
-- Bulk loading from sorted data
+- Bulk loading from sorted data (`bulk_load`, `bulk_load_dedup`)
 - Depth-triggered localized subtree rebuilds
 - Tombstone compaction for remove-heavy workloads
 - `get_or_insert` / `get_or_insert_with` entry API
+- `clear()` / `drain()` for bulk removal
+- `allocated_bytes()` for memory introspection
 - `LearnedSet` wrapper for key-only use
 - Optional serde support (`features = ["serde"]`)
 
