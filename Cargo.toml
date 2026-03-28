@@ -9,6 +9,7 @@ description = "A concurrent sorted key-value map backed by learned index structu
 repository = "https://github.com/slush97/scry-index"
 keywords = ["learned-index", "concurrent", "sorted-map", "data-structure"]
 categories = ["data-structures", "concurrency"]
+documentation = "https://docs.rs/scry-index"
 readme = "README.md"
 exclude = ["contrib/", "fuzz/", "CLAUDE.md"]
 

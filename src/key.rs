@@ -10,7 +10,7 @@
 ///
 /// - `to_model_input` must be a **monotonic** function: if `a < b` then
 ///   `a.to_model_input() <= b.to_model_input()`. Note: the mapping is
-///   non-strict — distinct keys may produce the same `f64` due to precision
+///   non-strict: distinct keys may produce the same `f64` due to precision
 ///   loss (e.g., `u64` keys above 2^53). The index handles this correctly
 ///   via the `to_exact_ordinal` fallback.
 /// - The returned `f64` must be finite (not NaN or infinity).
@@ -117,7 +117,7 @@ fn bytes_to_model_input(bytes: &[u8]) -> f64 {
 /// then apply the sign-flip bijection to produce an order-preserving `i128`.
 ///
 /// Shorter slices are zero-padded on the right. For slices longer than 16
-/// bytes, only the first 16 bytes are used — keys that share a 16-byte
+/// bytes, only the first 16 bytes are used. Keys that share a 16-byte
 /// prefix will produce the same ordinal (non-injective). The index handles
 /// these collisions via `Ord`-based splits in the node.
 #[inline]
@@ -140,7 +140,7 @@ fn bytes_to_exact_ordinal(bytes: &[u8]) -> i128 {
 ///   a monotonic mapping with respect to lexicographic order.
 /// - `to_exact_ordinal`: interprets the first 16 bytes as a big-endian `u128`
 ///   (with the same sign-flip trick as `u128`). This is injective for `N <= 16`.
-///   For `N > 16`, it is a best-effort prefix — distinct keys that share their
+///   For `N > 16`, it is a best-effort prefix: distinct keys that share their
 ///   first 16 bytes will collide. The index resolves these via `Ord`-based
 ///   splits in the node.
 impl<const N: usize> Key for [u8; N] {
@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn byte4_exact_ordinal_monotonic() {
-        // For N < 16, zero-padded — still strictly monotonic for lex order
+        // For N < 16, zero-padded; still strictly monotonic for lex order
         let keys: Vec<[u8; 4]> = vec![[0, 0, 0, 0], [0, 0, 0, 1], [0, 0, 1, 0], [1, 0, 0, 0]];
         for pair in keys.windows(2) {
             assert!(

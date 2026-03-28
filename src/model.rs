@@ -156,7 +156,7 @@ pub fn fit_fmcd(
     let key_range = last - first;
 
     if key_range.abs() < f64::EPSILON {
-        // All keys are the same value — map all to the middle
+        // All keys are the same value. Map all to the middle.
         return FmcdResult {
             model: LinearModel::new(0.0, (array_size / 2) as f64),
             array_size,
@@ -185,7 +185,7 @@ pub fn fit_fmcd(
 
     // --- FMCD: try slopes derived from the maximum inter-key gap ---
     // The insight: the optimal slope often places the widest-gap pair at
-    // consecutive slots. Trying multiples of 1/max_gap efficiently searches
+    // consecutive slots. Trying multiples of 1/max_gap searches
     // for the minimum-conflict model.
     let mut max_gap = 0.0_f64;
     for i in 0..n - 1 {

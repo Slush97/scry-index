@@ -88,7 +88,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                             continue 'retry;
                         }
                     }
-                    // Only rebuild if depth exceeded the threshold — the subtree
+                    // Only rebuild if depth exceeded the threshold. The subtree
                     // actually degraded beyond the capture point. Rebuilding when
                     // depth == threshold wastes work on already-compact subtrees.
                     if config.auto_rebuild && depth > config.rebuild_depth_threshold {
@@ -98,7 +98,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                     }
                     return InsertResult::Inserted;
                 }
-                // CAS failed — slot changed, retry from state read.
+                // CAS failed, slot changed. Retry from state read.
                 continue;
             }
 
@@ -119,7 +119,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                     }
                     return InsertResult::Inserted;
                 }
-                // CAS failed — slot changed, retry.
+                // CAS failed, slot changed. Retry.
                 continue;
             }
 
@@ -143,7 +143,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                             InsertResult::Updated
                         };
                     }
-                    // CAS failed — slot changed, retry.
+                    // CAS failed, slot changed. Retry.
                     continue;
                 }
 
@@ -169,7 +169,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                     }
                     return InsertResult::Inserted;
                 }
-                // CAS failed — slot changed, retry.
+                // CAS failed, slot changed. Retry.
                 continue;
             }
 
@@ -193,7 +193,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                 depth += 1;
                 // Capture the shallowest child on the descent path. If depth
                 // eventually exceeds the threshold, we rebuild from this point,
-                // flattening the entire degraded chain — not just a small
+                // flattening the entire degraded chain, not just a small
                 // subtree deep in the tree.
                 if rebuild_candidate.is_none() {
                     rebuild_candidate = Some((current_node, slot_idx));
@@ -207,7 +207,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                 continue;
             }
 
-            // Unknown state — spin and re-read (defensive).
+            // Unknown state. Spin and re-read (defensive).
             std::hint::spin_loop();
         }
     } // 'retry
@@ -216,7 +216,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
 /// Atomically get an existing value or insert a new one.
 ///
 /// If the key already exists, returns a reference to the existing value and
-/// [`InsertResult::Updated`] (signalling "already existed — no insert performed").
+/// [`InsertResult::Updated`] (signalling "already existed, no insert performed").
 /// If the key is absent, inserts the key-value pair and returns a reference to
 /// the new value with [`InsertResult::Inserted`].
 ///
@@ -269,7 +269,7 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
                     let val = unsafe { current_node.read_value(slot_idx) };
                     return (val, InsertResult::Inserted);
                 }
-                // CAS failed — slot changed, retry.
+                // CAS failed, slot changed. Retry.
                 continue;
             }
 
@@ -292,7 +292,7 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
                     let val = unsafe { current_node.read_value(slot_idx) };
                     return (val, InsertResult::Inserted);
                 }
-                // CAS failed — slot changed, retry.
+                // CAS failed, slot changed. Retry.
                 continue;
             }
 
@@ -342,7 +342,7 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
                     }
                     // Should not happen by construction; loop retries.
                 }
-                // CAS failed — slot changed, retry.
+                // CAS failed, slot changed. Retry.
                 continue;
             }
 
@@ -370,7 +370,7 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
                 continue;
             }
 
-            // Unknown state — spin and re-read (defensive).
+            // Unknown state. Spin and re-read (defensive).
             std::hint::spin_loop();
         }
     } // 'retry
@@ -392,7 +392,7 @@ fn build_single_entry_child<K: Key, V: Clone + Send + Sync>(key: &K, value: V) -
 /// Build a small child node from two conflicting key-value pairs.
 ///
 /// Uses direct placement into a 4-slot node instead of full FMCD fitting.
-/// For just 2 keys, FMCD is overkill — a simple linear interpolation into
+/// For just 2 keys, FMCD is overkill. A simple linear interpolation into
 /// a tiny array is sufficient and avoids the allocation + scan overhead.
 fn build_conflict_node<K: Key, V: Clone + Send + Sync>(
     k1: K,
@@ -439,7 +439,7 @@ fn build_conflict_node<K: Key, V: Clone + Send + Sync>(
     node.inc_keys();
 
     if s1 == s2 {
-        // Still collide — insert the second key via the concurrent insert path
+        // Still collide. Insert the second key via the concurrent insert path
         // (with unprotected guard since this is single-threaded construction).
         // SAFETY: Exclusive access during construction. The unprotected guard
         // is safe because no concurrent readers exist for this node yet.

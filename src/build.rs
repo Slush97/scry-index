@@ -43,7 +43,7 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
         }
     }
 
-    // Pass pairs directly — fit_fmcd extracts keys via closure, avoiding a
+    // Pass pairs directly. fit_fmcd extracts keys via closure, avoiding a
     // separate Vec<K> allocation.
     let result = fit_fmcd(
         n,
@@ -53,7 +53,7 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
     );
 
     if result.conflicts == 0 {
-        // No conflicts — use a leaf node (no children array allocation).
+        // No conflicts: use a leaf node (no children array allocation).
         let node = Node::with_capacity_leaf(result.model, result.array_size);
         for (key, value) in pairs {
             let slot = node.predict_slot(key);
@@ -63,7 +63,7 @@ pub(crate) fn build_recursive<K: Key, V: Clone>(pairs: &[(K, V)], config: &Confi
         return node;
     }
 
-    // Conflicts exist — sort by predicted slot, then process runs.
+    // Conflicts exist: sort by predicted slot, then process runs.
     let node = Node::with_capacity(result.model, result.array_size);
 
     let mut assignments: Vec<(usize, usize)> = pairs

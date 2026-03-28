@@ -4,13 +4,22 @@
 //!
 //! This crate provides [`LearnedMap`], a sorted map that uses piecewise linear
 //! models to predict key positions, achieving O(1) expected lookup time for
-//! keys matching the data distribution.
+//! keys matching the data distribution. A [`LearnedSet`] wrapper is also
+//! available for key-only use cases.
+//!
+//! # Supported key types
+//!
+//! Any type implementing [`Key`] can be used. Built-in implementations cover:
+//!
+//! - Integer types: `u8`..`u128`, `i8`..`i128`
+//! - Byte arrays: `[u8; N]` for any `N` (UUIDs, hashes, etc.)
+//! - Heap-allocated: `String`, `Vec<u8>`
 //!
 //! # Concurrency
 //!
 //! All operations take `&self` and are safe to call from multiple threads.
 //! Reads are lock-free (atomic loads under an epoch guard). Writes use
-//! CAS retry loops on individual slots — no global lock.
+//! CAS retry loops on individual slots with no global lock.
 //!
 //! # Algorithm
 //!
@@ -26,15 +35,31 @@
 //! use scry_index::LearnedMap;
 //!
 //! let map = LearnedMap::new();
-//! let guard = map.guard();
+//! let m = map.pin();
 //!
-//! map.insert(42u64, "hello", &guard);
-//! map.insert(17u64, "world", &guard);
+//! m.insert(42u64, "hello");
+//! m.insert(17u64, "world");
 //!
-//! assert_eq!(map.get(&42, &guard), Some(&"hello"));
-//! assert_eq!(map.get(&99, &guard), None);
-//! assert_eq!(map.len(), 2);
+//! assert_eq!(m.get(&42), Some(&"hello"));
+//! assert_eq!(m.get(&99), None);
+//! assert_eq!(m.len(), 2);
 //! ```
+//!
+//! For pre-sorted data, [`LearnedMap::bulk_load`] builds an optimal tree in
+//! one pass:
+//!
+//! ```
+//! use scry_index::LearnedMap;
+//!
+//! let data: Vec<(u64, &str)> = vec![(1, "a"), (2, "b"), (3, "c")];
+//! let map = LearnedMap::bulk_load(&data).unwrap();
+//! assert_eq!(map.pin().get(&2), Some(&"b"));
+//! ```
+//!
+//! # Feature flags
+//!
+//! - **`serde`**: Enables `Serialize`/`Deserialize` for [`LearnedMap`],
+//!   [`LearnedSet`], [`Config`], and [`Error`].
 
 mod build;
 mod config;

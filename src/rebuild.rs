@@ -82,7 +82,7 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
     let child_atomic = parent_node.child_atomic(parent_slot_idx);
     let current = child_atomic.load(Ordering::Acquire, guard);
 
-    // Null or already frozen by another rebuild — bail out.
+    // Null or already frozen by another rebuild. Bail out.
     if current.is_null() || current.tag() != 0 {
         return false;
     }
@@ -111,7 +111,7 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
 
     let pairs = iter::sorted_pairs(child, guard);
     if pairs.len() <= 1 {
-        // Too small to rebuild — FreezeGuard::drop unfreezes.
+        // Too small to rebuild. FreezeGuard::drop unfreezes.
         return false;
     }
 
@@ -139,7 +139,7 @@ pub fn try_rebuild_subtree<K: Key, V: Clone + Send + Sync>(
             // In-flight inserts (threads that loaded the child pointer before
             // the freeze) detect the stale subtree via descent_snapshot
             // validation in insert::insert and retry automatically. No
-            // explicit recovery scan is needed — the happens-before chain
+            // explicit recovery scan is needed. The happens-before chain
             // between insert CAS, validation, freeze, and snapshot guarantees
             // that any insert completing before the freeze is captured in the
             // snapshot.

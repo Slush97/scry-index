@@ -27,7 +27,7 @@ use crate::model::LinearModel;
 /// Lazily-initialized array of epoch-protected child pointers.
 type ChildArray<K, V> = OnceLock<Box<[Atomic<Node<K, V>>]>>;
 
-/// Slot is unused — no inline data, no child.
+/// Slot is unused. No inline data, no child.
 pub const SLOT_EMPTY: u8 = 0;
 /// Slot is being claimed by a concurrent insert (transient).
 /// Other threads seeing this state should spin-retry.
@@ -56,9 +56,9 @@ pub fn is_child(state: u8) -> bool {
 /// for inline key-value storage. Conflicts are resolved by creating child
 /// nodes stored via epoch-protected [`Atomic`] pointers.
 ///
-/// Keys and values are stored **inline** in contiguous arrays — no per-entry
-/// heap allocation. This dramatically reduces allocation overhead compared
-/// to the pointer-per-entry design, especially for bulk loading.
+/// Keys and values are stored **inline** in contiguous arrays with no per-entry
+/// heap allocation, reducing allocation overhead compared to a
+/// pointer-per-entry design.
 pub struct Node<K, V> {
     /// The linear model for this node (immutable after construction).
     model: LinearModel,
@@ -363,7 +363,7 @@ impl<K: Key, V> Node<K, V> {
             return false;
         }
         // Overwrite inline storage. The old stale data is not explicitly dropped
-        // here — for Copy types this is fine; for Drop types the old data's
+        // here. For Copy types this is fine; for Drop types the old data's
         // destructor is skipped (acceptable since the node rebuild will reclaim).
         unsafe {
             (*self.keys[idx].get()) = MaybeUninit::new(key);
@@ -510,7 +510,7 @@ impl<K: Key, V> Node<K, V> {
 
 impl<K, V> Drop for Node<K, V> {
     fn drop(&mut self) {
-        // SAFETY: We have exclusive access during drop — no other thread can
+        // SAFETY: We have exclusive access during drop. No other thread can
         // reference this node.
         unsafe {
             let guard = epoch::unprotected();

@@ -27,8 +27,8 @@ for (k, v) in m.range(1u64..50) {
 
 ## Tradeoffs
 
-Read-optimized. Lookups are dramatically faster; writes are competitive for
-sequential and time-series workloads.
+Read-optimized. Writes are competitive for sequential and time-series
+workloads.
 
 | Operation | LearnedMap | BTreeMap | |
 |---|---|---|---|
@@ -40,12 +40,12 @@ sequential and time-series workloads.
 | Bulk load (100K) | 3.7 ms | 2.0 ms | 1.8x slower |
 
 The O(1) model-predicted lookup vs O(log n) tree walk advantage grows with
-scale and is especially pronounced under random access patterns where
-BTreeMap suffers cache misses.
+scale. Random access patterns widen the gap further because BTreeMap
+suffers cache misses at depth.
 
 Good for read-heavy, concurrent workloads with sorted keys (time-series
 queries, lookup tables, analytics indexes). Random-key insert is slower
-(~4-6x) due to model collisions — use bulk loading when possible.
+(~4-6x) due to model collisions. Use bulk loading when possible.
 
 ```sh
 cargo bench                                      # criterion microbenchmarks

@@ -28,7 +28,7 @@ const INITIAL_ROOT_REBUILD_THRESHOLD: usize = 64;
 /// Growth factor between successive root rebuild thresholds.
 /// Schedule: 64, 128, 256, 512, 1024, 2048, ...
 /// Total amortized rebuild cost: sum of geometric series ≈ 2N = O(N).
-/// Using 2x (not 4x) keeps the root model fresh — critical because keys
+/// Using 2x (not 4x) keeps the root model fresh. This matters because keys
 /// outside the model's fitted range all clamp to the last slot.
 const ROOT_REBUILD_GROWTH_FACTOR: usize = 2;
 
@@ -184,11 +184,19 @@ impl<K: Key, V: Clone + Send + Sync> MapRef<'_, K, V> {
 /// Uses piecewise linear models to predict key positions, achieving O(1)
 /// expected lookup time for keys matching the data distribution.
 ///
+/// # When to use
+///
+/// Best suited for read-heavy, concurrent workloads with sorted keys
+/// (time-series queries, lookup tables, analytics indexes). Point lookups
+/// are faster than `BTreeMap`; writes are competitive for sequential and
+/// append-only patterns. For random-key insert-heavy workloads, prefer
+/// [`bulk_load`](Self::bulk_load) over one-by-one insertion.
+///
 /// # Concurrency
 ///
 /// All operations take `&self` and are safe to call from multiple threads.
 /// Reads are lock-free (atomic loads under an epoch guard). Writes use
-/// compare-and-swap retry loops on individual slots — no global lock.
+/// compare-and-swap retry loops on individual slots. No global lock.
 ///
 /// # Example
 ///
@@ -241,8 +249,8 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
 
     /// Create a learned map from sorted key-value pairs.
     ///
-    /// This is significantly faster than inserting one-by-one because it
-    /// builds the tree structure optimally using FMCD model fitting.
+    /// Faster than inserting one-by-one because it builds the tree
+    /// structure in one pass using FMCD model fitting.
     ///
     /// # Errors
     ///
@@ -467,7 +475,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// without modifying it. If the key is absent, inserts the key-value pair
     /// and returns a reference to the newly inserted value.
     ///
-    /// This is atomic with respect to concurrent operations — there is no
+    /// This is atomic with respect to concurrent operations. There is no
     /// TOCTOU race between checking and inserting.
     #[allow(clippy::needless_pass_by_value)]
     pub fn get_or_insert<'g>(&self, key: K, value: V, guard: &'g Guard) -> &'g V {
@@ -521,7 +529,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// Return the approximate number of key-value pairs in the map.
     ///
     /// Uses a relaxed atomic load internally. Under concurrent inserts or
-    /// removes the returned value may be slightly stale — it is **not**
+    /// removes the returned value may be slightly stale. It is **not**
     /// linearizable with respect to other operations. For an exact count,
     /// call [`iter`](Self::iter) and count the entries, which gives a
     /// consistent snapshot under the epoch guard.
@@ -593,10 +601,8 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// Estimate the total heap memory allocated by this map, in bytes.
     ///
     /// Walks the entire tree and sums up node structs, slot arrays, and
-    /// per-entry allocations. This is an approximation — it does not account
+    /// per-entry allocations. This is an approximation: it does not account
     /// for allocator overhead, alignment padding, or epoch-deferred garbage.
-    ///
-    /// Useful for monitoring memory usage in long-running processes.
     pub fn allocated_bytes(&self, guard: &Guard) -> usize {
         let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
         // SAFETY: root is always non-null.
@@ -606,7 +612,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
 
     /// Return the maximum depth of the tree.
     ///
-    /// Useful for diagnostics — a well-fit model should keep depth low.
+    /// A well-fit model keeps depth low (typically 1-3 after bulk load).
     pub fn max_depth(&self, guard: &Guard) -> usize {
         let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
         // SAFETY: root is always non-null.
@@ -697,7 +703,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             unsafe {
                 guard.inner.defer_destroy(root_shared);
             }
-            // Don't reset len — it's maintained solely by map::insert
+            // Don't reset len. It's maintained solely by map::insert
             // (fetch_add) and map::remove (fetch_sub). Resetting via store
             // would race with concurrent fetch_adds.
             let count = pairs.len();
@@ -707,7 +713,7 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
                 Ordering::Relaxed,
             );
         } else {
-            // CAS failed after freeze — shouldn't happen, but unfreeze.
+            // CAS failed after freeze. Should not happen, but unfreeze.
             let _ = self.root.compare_exchange(
                 frozen,
                 root_shared,
@@ -1406,7 +1412,7 @@ mod tests {
         let map = LearnedMap::bulk_load(&pairs).unwrap();
         let g = map.guard();
         let bytes = map.allocated_bytes(&g);
-        // Sanity: at minimum each entry occupies size_of key + value in a SlotInner.
+        // Sanity: at minimum each entry occupies size_of key + value.
         let min_data_bytes = 500 * std::mem::size_of::<u64>() * 2;
         assert!(
             bytes > min_data_bytes,
