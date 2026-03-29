@@ -84,15 +84,18 @@ impl<K: Key> LearnedSet<K> {
         }
     }
 
-    /// Create a set from sorted keys.
+    /// Create a set from sorted keys, deduplicating any repeated keys.
+    ///
+    /// Keys must be in ascending order but duplicates are allowed and will
+    /// be silently removed (sets are idempotent by definition).
     ///
     /// # Errors
     ///
-    /// Returns an error if `keys` is empty or not sorted.
+    /// Returns an error if `keys` is empty (after dedup) or not sorted.
     pub fn bulk_load(keys: &[K]) -> Result<Self> {
         let pairs: Vec<(K, ())> = keys.iter().map(|k| (k.clone(), ())).collect();
         Ok(Self {
-            inner: LearnedMap::bulk_load(&pairs)?,
+            inner: LearnedMap::bulk_load_dedup(&pairs)?,
         })
     }
 
@@ -257,6 +260,17 @@ mod tests {
         assert_eq!(set.len(), 100);
         for k in &keys {
             assert!(set.contains(k, &g));
+        }
+    }
+
+    #[test]
+    fn bulk_load_deduplicates() {
+        let keys: Vec<u64> = vec![1, 1, 2, 3, 3, 3, 4, 5];
+        let set = LearnedSet::bulk_load(&keys).unwrap();
+        let g = set.guard();
+        assert_eq!(set.len(), 5);
+        for k in 1..=5u64 {
+            assert!(set.contains(&k, &g), "key {k} missing after dedup");
         }
     }
 

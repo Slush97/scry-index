@@ -103,9 +103,10 @@ src/
 
 ### Absolute Rules
 
-- **No `unsafe` code.** `#[forbid(unsafe_code)]` is set in Cargo.toml. Phase 2
-  concurrency will use safe abstractions from crossbeam. If we hit a wall, we
-  discuss and explicitly opt in per-module, never globally.
+- **Minimal `unsafe` code.** `unsafe_code = "deny"` is set in Cargo.toml.
+  Modules that require unsafe (epoch pointer deref, inline slot access) opt in
+  with `#[allow(unsafe_code)]` per-module. Each unsafe block has a `// SAFETY:`
+  comment justifying correctness. Never add unsafe globally.
 - **Clippy pedantic + nursery.** All warnings are errors in CI. Fix them, don't
   suppress them, unless there is a documented reason in the allow list.
 - **Every public item has a doc comment.** `missing_docs = "warn"` is enforced.
