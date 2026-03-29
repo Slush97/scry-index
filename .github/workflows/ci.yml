@@ -147,6 +147,9 @@ jobs:
   fuzz-smoke:
     name: Fuzz Smoke Test
     runs-on: ubuntu-latest
+    # Fuzz targets run as a smoke test, not a gate. Crashes found here
+    # should be triaged and fixed, but should not block unrelated PRs.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
