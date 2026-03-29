@@ -15,6 +15,10 @@
 //! - Byte arrays: `[u8; N]` for any `N` (UUIDs, hashes, etc.)
 //! - Heap-allocated: `String`, `Vec<u8>`
 //!
+//! For custom key types with a byte representation, the public helpers
+//! [`bytes_to_model_input`] and [`bytes_to_exact_ordinal`] can be used to
+//! implement the [`Key`] trait.
+//!
 //! # Concurrency
 //!
 //! All operations take `&self` and are safe to call from multiple threads.
@@ -78,6 +82,6 @@ mod set;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use iter::{Iter, Range};
-pub use key::Key;
+pub use key::{bytes_to_exact_ordinal, bytes_to_model_input, Key};
 pub use map::{Guard, LearnedMap, MapRef};
 pub use set::{LearnedSet, SetRef};

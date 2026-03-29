@@ -907,6 +907,10 @@ impl<K: Key, V: Clone + Send + Sync> Extend<(K, V)> for LearnedMap<K, V> {
     }
 }
 
+/// Note: `from_iter` inserts elements one at a time into an empty map.
+/// For pre-sorted data, [`LearnedMap::bulk_load`] is significantly faster
+/// because it fits an optimal model in a single pass rather than
+/// building incrementally with conflict resolution.
 impl<K: Key, V: Clone + Send + Sync> FromIterator<(K, V)> for LearnedMap<K, V> {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
         let map = Self::new();

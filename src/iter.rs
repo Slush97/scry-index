@@ -15,6 +15,21 @@ use crate::node::{is_child, Node, SLOT_DATA, SLOT_WRITING};
 /// DFS traversal produces keys in ascending order because the linear model is
 /// monotonic (non-negative slope fitted from sorted keys) and children at
 /// slot `s` contain only keys whose predicted position is `s`.
+///
+/// # Visibility under concurrency
+///
+/// The iterator provides a best-effort snapshot, not a linearizable one:
+///
+/// - Keys inserted into **not-yet-scanned** slots may be visible.
+/// - Keys inserted into **already-scanned** slots will not be visible.
+/// - Keys removed (tombstoned) after scanning will still be yielded if
+///   they were `DATA` when scanned.
+/// - A slot in the transient `WRITING` state is waited on (with backoff)
+///   until the insert completes, so in-flight writes are not silently missed.
+///
+/// For a fully consistent snapshot, use
+/// [`iter_sorted`](crate::LearnedMap::iter_sorted), which clones all entries
+/// under a single traversal.
 pub struct Iter<'g, K, V> {
     /// Stack of (node, `next_slot_index`) for DFS traversal.
     stack: Vec<(&'g Node<K, V>, usize)>,
@@ -111,6 +126,8 @@ pub fn sorted_pairs<K: Key, V: Clone>(root: &Node<K, V>, guard: &Guard) -> Vec<(
 /// Yields only entries whose keys fall within the specified bounds, in
 /// ascending key order. Uses model-guided seek for O(depth) initialization
 /// when the start bound is specified.
+///
+/// See [`Iter`] for visibility semantics under concurrency.
 pub struct Range<'g, K, V> {
     /// Stack of (node, `next_slot_index`) for DFS traversal.
     stack: Vec<(&'g Node<K, V>, usize)>,

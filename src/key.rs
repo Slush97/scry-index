@@ -101,12 +101,15 @@ impl Key for i128 {
     }
 }
 
-/// Interpret the first 8 bytes of a byte slice as a big-endian `u64` → `f64`.
+/// Interpret the first 8 bytes of a byte slice as a big-endian `u64` -> `f64`.
 ///
 /// Shorter slices are zero-padded on the right. Provides a monotonic mapping
 /// with respect to lexicographic byte order.
+///
+/// This helper is useful for implementing [`Key::to_model_input`] on custom
+/// types that have a byte representation.
 #[inline]
-fn bytes_to_model_input(bytes: &[u8]) -> f64 {
+pub fn bytes_to_model_input(bytes: &[u8]) -> f64 {
     let mut buf = [0u8; 8];
     let len = bytes.len().min(8);
     buf[..len].copy_from_slice(&bytes[..len]);
@@ -120,9 +123,12 @@ fn bytes_to_model_input(bytes: &[u8]) -> f64 {
 /// bytes, only the first 16 bytes are used. Keys that share a 16-byte
 /// prefix will produce the same ordinal (non-injective). The index handles
 /// these collisions via `Ord`-based splits in the node.
+///
+/// This helper is useful for implementing [`Key::to_exact_ordinal`] on custom
+/// types that have a byte representation.
 #[inline]
 #[allow(clippy::cast_possible_wrap)]
-fn bytes_to_exact_ordinal(bytes: &[u8]) -> i128 {
+pub fn bytes_to_exact_ordinal(bytes: &[u8]) -> i128 {
     let mut buf = [0u8; 16];
     let len = bytes.len().min(16);
     buf[..len].copy_from_slice(&bytes[..len]);
