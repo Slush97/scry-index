@@ -6,6 +6,7 @@
 #![allow(unsafe_code)]
 
 use crossbeam_epoch::{Guard, Shared};
+use crossbeam_utils::Backoff;
 
 use crate::config::Config;
 use crate::key::Key;
@@ -34,6 +35,7 @@ pub fn remove<K: Key, V: Clone + Send + Sync>(
     // Outer retry loop: if a concurrent rebuild orphans the subtree we
     // removed from, we restart the remove from the root.
     'retry: loop {
+        let backoff = Backoff::new();
         let mut current_node = node;
         let mut rebuild_candidate: Option<(&Node<K, V>, usize)> = None;
         // Track the first child descent so we can detect if a concurrent
@@ -48,7 +50,7 @@ pub fn remove<K: Key, V: Clone + Send + Sync>(
             match state {
                 SLOT_EMPTY | SLOT_TOMBSTONE => return was_removed,
                 SLOT_WRITING => {
-                    std::hint::spin_loop();
+                    backoff.snooze();
                 }
                 SLOT_DATA => {
                     // SAFETY: state is DATA, so the key slot is initialized.
@@ -91,7 +93,7 @@ pub fn remove<K: Key, V: Clone + Send + Sync>(
                     // subtree. Spin until the rebuild completes, then re-predict
                     // (the slot now points to the rebuilt child).
                     if child_shared.tag() != 0 {
-                        std::hint::spin_loop();
+                        backoff.snooze();
                         continue;
                     }
                     if child_shared.is_null() {

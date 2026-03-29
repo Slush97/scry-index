@@ -380,11 +380,12 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     #[allow(clippy::needless_pass_by_value)]
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> bool {
         let mut was_new = false;
+        let backoff = crossbeam_utils::Backoff::new();
         loop {
             let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
             // If root is frozen (tagged), a global rebuild is in progress.
             if root_shared.tag() != 0 {
-                std::hint::spin_loop();
+                backoff.snooze();
                 continue;
             }
             // SAFETY: root is always non-null.
@@ -444,11 +445,12 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// decremented exactly once.
     pub fn remove(&self, key: &K, guard: &Guard) -> bool {
         let mut was_removed = false;
+        let backoff = crossbeam_utils::Backoff::new();
         loop {
             let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
             // If root is frozen (tagged), a global rebuild is in progress.
             if root_shared.tag() != 0 {
-                std::hint::spin_loop();
+                backoff.snooze();
                 continue;
             }
             // SAFETY: root is always non-null.
@@ -480,10 +482,11 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     #[allow(clippy::needless_pass_by_value)]
     pub fn get_or_insert<'g>(&self, key: K, value: V, guard: &'g Guard) -> &'g V {
         let mut was_new = false;
+        let backoff = crossbeam_utils::Backoff::new();
         loop {
             let root_shared = self.root.load(Ordering::Acquire, &guard.inner);
             if root_shared.tag() != 0 {
-                std::hint::spin_loop();
+                backoff.snooze();
                 continue;
             }
             // SAFETY: root is always non-null.

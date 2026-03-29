@@ -13,6 +13,7 @@
 #![allow(unsafe_code)]
 
 use crossbeam_epoch::{self as epoch, Guard, Shared};
+use crossbeam_utils::Backoff;
 
 use crate::config::Config;
 use crate::key::Key;
@@ -56,6 +57,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
     // Outer retry loop: if a concurrent rebuild orphans the subtree we
     // inserted into, we restart the insert from the root.
     'retry: loop {
+        let backoff = Backoff::new();
         let mut current_node = node;
         let mut depth: usize = 0;
         let mut rebuild_candidate: Option<(&Node<K, V>, usize)> = None;
@@ -70,8 +72,8 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
             let state = current_node.slot_state(slot_idx);
 
             if state == SLOT_WRITING {
-                // Another thread is claiming this slot. Spin and re-read.
-                std::hint::spin_loop();
+                // Another thread is claiming this slot. Back off and re-read.
+                backoff.snooze();
                 continue;
             }
 
@@ -181,7 +183,7 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                 // subtree. Spin until the rebuild completes, then re-predict
                 // (the slot now points to the rebuilt child).
                 if child_shared.tag() != 0 {
-                    std::hint::spin_loop();
+                    backoff.snooze();
                     continue;
                 }
 
@@ -207,8 +209,8 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                 continue;
             }
 
-            // Unknown state. Spin and re-read (defensive).
-            std::hint::spin_loop();
+            // Unknown state. Back off and re-read (defensive).
+            backoff.snooze();
         }
     } // 'retry
 }
@@ -234,6 +236,7 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
     let mut retry_was_new = false;
 
     'retry: loop {
+        let backoff = Backoff::new();
         let mut current_node: &'g Node<K, V> = node;
         let mut depth: usize = 0;
         let mut rebuild_candidate: Option<(&'g Node<K, V>, usize)> = None;
@@ -245,7 +248,7 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
             let state = current_node.slot_state(slot_idx);
 
             if state == SLOT_WRITING {
-                std::hint::spin_loop();
+                backoff.snooze();
                 continue;
             }
 
@@ -350,7 +353,7 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
                 let child_shared = current_node.load_child(slot_idx, guard);
 
                 if child_shared.tag() != 0 {
-                    std::hint::spin_loop();
+                    backoff.snooze();
                     continue;
                 }
 
@@ -370,8 +373,8 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
                 continue;
             }
 
-            // Unknown state. Spin and re-read (defensive).
-            std::hint::spin_loop();
+            // Unknown state. Back off and re-read (defensive).
+            backoff.snooze();
         }
     } // 'retry
 }

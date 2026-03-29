@@ -4,6 +4,7 @@
 use std::ops::{Bound, RangeBounds};
 
 use crossbeam_epoch::Guard;
+use crossbeam_utils::Backoff;
 
 use crate::key::Key;
 use crate::node::{is_child, Node, SLOT_DATA, SLOT_WRITING};
@@ -78,10 +79,13 @@ impl<'g, K: Key, V> Iterator for Iter<'g, K, V> {
                     }
                 }
                 SLOT_WRITING => {
-                    // A concurrent insert is claiming this slot. Spin briefly
+                    // A concurrent insert is claiming this slot. Back off
                     // so rebuild snapshots don't miss in-flight writes.
-                    *slot_idx -= 1; // re-visit this slot
-                    std::hint::spin_loop();
+                    let backoff = Backoff::new();
+                    while node.slot_state(current_idx) == SLOT_WRITING {
+                        backoff.snooze();
+                    }
+                    *slot_idx -= 1; // re-visit this slot with resolved state
                 }
                 _ => {} // EMPTY, TOMBSTONE
             }
@@ -244,10 +248,13 @@ impl<'g, K: Key, V> Iterator for Range<'g, K, V> {
                     }
                 }
                 SLOT_WRITING => {
-                    // A concurrent insert is claiming this slot. Spin briefly
+                    // A concurrent insert is claiming this slot. Back off
                     // so rebuild snapshots don't miss in-flight writes.
-                    *slot_idx -= 1; // re-visit this slot
-                    std::hint::spin_loop();
+                    let backoff = Backoff::new();
+                    while node.slot_state(current_idx) == SLOT_WRITING {
+                        backoff.snooze();
+                    }
+                    *slot_idx -= 1; // re-visit this slot with resolved state
                 }
                 _ => {} // EMPTY, TOMBSTONE
             }
