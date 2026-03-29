@@ -269,6 +269,13 @@ impl<K: Key, V> Node<K, V> {
     ///
     /// Caller must ensure the slot has inline data (state is DATA, `CHILD_STALE`,
     /// or TOMBSTONE) and that the data will not be concurrently modified.
+    ///
+    /// **Known `TSan` report**: A concurrent [`cas_tombstone_to_data`](Self::cas_tombstone_to_data)
+    /// can write to this `UnsafeCell` while a reader that loaded state=`DATA`
+    /// before the `DATA`->`TOMBSTONE` transition is still reading. This is a
+    /// real data race in the C++ memory model but benign on all real hardware
+    /// (aligned word-sized reads/writes are atomic on x86 and ARM). Any CAS
+    /// that depends on the read result will fail and retry if the state changed.
     #[inline]
     pub unsafe fn read_key(&self, idx: usize) -> &K {
         (*self.keys[idx].get()).assume_init_ref()
@@ -279,7 +286,8 @@ impl<K: Key, V> Node<K, V> {
     /// # Safety
     ///
     /// Caller must ensure the slot has inline data (state is DATA) and that
-    /// the data will not be concurrently modified.
+    /// the data will not be concurrently modified. See [`read_key`](Self::read_key)
+    /// for the known `TSan` race window.
     #[inline]
     pub unsafe fn read_value(&self, idx: usize) -> &V {
         (*self.values[idx].get()).assume_init_ref()

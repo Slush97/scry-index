@@ -97,10 +97,13 @@ jobs:
   sanitizer:
     name: Thread Sanitizer
     runs-on: ubuntu-latest
-    # TSan cannot reason about crossbeam-epoch's CAS-based synchronization
-    # protocol and reports false positives on the UnsafeCell writes that are
-    # protected by atomic state transitions. Kept as informational until we
-    # can add TSan suppressions for crossbeam-epoch internals.
+    # TSan reports a real race between UnsafeCell reads (after loading
+    # state=DATA) and concurrent writes (cas_tombstone_to_data). The race
+    # is benign on real hardware (aligned word reads/writes are atomic on
+    # x86 and ARM) and all CAS operations that depend on the read will
+    # fail-and-retry if the state changed. Fixing requires atomic key/value
+    # storage or per-slot locks, both of which are architectural changes.
+    # See node.rs read_key() safety docs for details.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
