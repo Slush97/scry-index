@@ -291,32 +291,51 @@ pub fn first_entry<'g, K: Key, V>(
 
 /// Return the last (maximum) key-value pair in the tree.
 ///
-/// Scans slots right-to-left at each level, following the rightmost non-empty
-/// slot. Returns `None` if the tree is empty. O(depth) typical.
+/// Uses a reverse DFS: scans slots right-to-left at each level, pushing
+/// children onto a stack. Correctly backtracks when a child subtree
+/// contains no data (e.g., all entries were removed).
+///
+/// Returns `None` if the tree is empty. O(depth) typical.
 pub fn last_entry<'g, K: Key, V>(root: &'g Node<K, V>, guard: &'g Guard) -> Option<(&'g K, &'g V)> {
-    let mut node = root;
+    // Stack of (node, next_slot_to_scan). Slots are scanned in reverse:
+    // slot_idx starts at capacity and decrements toward 0.
+    let mut stack: Vec<(&Node<K, V>, usize)> = vec![(root, root.capacity())];
     loop {
-        let mut child_found = None;
-        for i in (0..node.capacity()).rev() {
-            let state = node.slot_state(i);
-            match state {
-                SLOT_DATA => {
-                    // SAFETY: state is DATA, inline data is valid.
-                    let key = unsafe { node.read_key(i) };
-                    let value = unsafe { node.read_value(i) };
-                    return Some((key, value));
-                }
-                s if is_child(s) => {
-                    let child_shared = node.load_child(i, guard);
-                    if !child_shared.is_null() {
-                        child_found = Some(unsafe { child_shared.deref() });
-                        break;
-                    }
-                }
-                _ => {}
-            }
+        let (node, slot_idx) = stack.last_mut()?;
+        if *slot_idx == 0 {
+            // Exhausted this node. Backtrack to the parent.
+            stack.pop();
+            continue;
         }
-        node = child_found?;
+        *slot_idx -= 1;
+        let current_idx = *slot_idx;
+
+        let state = node.slot_state(current_idx);
+        match state {
+            SLOT_DATA => {
+                // SAFETY: state is DATA, inline data is valid.
+                let key = unsafe { node.read_key(current_idx) };
+                let value = unsafe { node.read_value(current_idx) };
+                return Some((key, value));
+            }
+            s if is_child(s) => {
+                let child_shared = node.load_child(current_idx, guard);
+                if !child_shared.is_null() {
+                    let child = unsafe { child_shared.deref() };
+                    stack.push((child, child.capacity()));
+                }
+            }
+            SLOT_WRITING => {
+                // Concurrent insert in progress. Wait for resolution.
+                let backoff = Backoff::new();
+                while node.slot_state(current_idx) == SLOT_WRITING {
+                    backoff.snooze();
+                }
+                // Re-visit this slot with the resolved state.
+                *slot_idx += 1;
+            }
+            _ => {} // EMPTY, TOMBSTONE
+        }
     }
 }
 

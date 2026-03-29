@@ -1251,3 +1251,61 @@ fn tombstone_compaction_then_reinsert() {
         assert_eq!(map.get(&i, &g2), Some(&i));
     }
 }
+
+/// Regression test for fuzz-discovered `last_key_value` bug.
+///
+/// After inserts and removes, `last_key_value` returned None even though the
+/// map contained entries. The old implementation failed to backtrack when
+/// descending into a child subtree that was empty after removes.
+#[allow(clippy::unreadable_literal)]
+#[test]
+fn last_key_value_after_remove_regression() {
+    let map = LearnedMap::new();
+    let g = map.guard();
+    let mut oracle = BTreeMap::new();
+
+    // Exact sequence from fuzz crash
+    for &(k, v) in &[
+        (14974415829223594775u64, 14974415777481871169u64),
+        (16855260271271864809, 16855260267347443713),
+        (1519143629599610133, 1519143629599610133),
+        (16855260271257916693, 16855260271271864809),
+        (16855260271271864809, 16855049165039331817),
+    ] {
+        map.insert(k, v, &g);
+        oracle.insert(k, v);
+    }
+    for &k in &[16855260271271864809u64, 16855260271272126953] {
+        map.remove(&k, &g);
+        oracle.remove(&k);
+    }
+
+    // Iter should match oracle
+    let learned: Vec<_> = map.iter(&g).map(|(k, v)| (*k, *v)).collect();
+    let expected: Vec<_> = oracle.iter().map(|(k, v)| (*k, *v)).collect();
+    assert_eq!(learned, expected, "iter mismatch");
+
+    // last_key_value must not return None when map is non-empty
+    let l = map.last_key_value(&g);
+    let b = oracle.iter().next_back();
+    match (l, b) {
+        (Some((lk, lv)), Some((bk, bv))) => {
+            assert_eq!(lk, bk, "last key mismatch");
+            assert_eq!(lv, bv, "last value mismatch");
+        }
+        (None, None) => {}
+        _ => panic!("last_key_value mismatch: learned={l:?}, oracle={b:?}"),
+    }
+
+    // first_key_value sanity check
+    let l = map.first_key_value(&g);
+    let b = oracle.iter().next();
+    match (l, b) {
+        (Some((lk, lv)), Some((bk, bv))) => {
+            assert_eq!(lk, bk, "first key mismatch");
+            assert_eq!(lv, bv, "first value mismatch");
+        }
+        (None, None) => {}
+        _ => panic!("first_key_value mismatch: learned={l:?}, oracle={b:?}"),
+    }
+}
