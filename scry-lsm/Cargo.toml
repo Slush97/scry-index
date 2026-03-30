@@ -1,0 +1,42 @@
+[package]
+name = "scry-lsm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83.0"
+description = "A minimal LSM-tree storage engine using scry-index as the memtable"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+scry-index = { path = ".." }
+crossbeam-epoch = "0.9"
+crossbeam-skiplist = "0.1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+tempfile = "3"
+
+[[bench]]
+name = "memtable"
+harness = false
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+redundant_pub_crate = "allow"
+missing_const_for_fn = "allow"
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+doc_markdown = "allow"
+significant_drop_tightening = "allow"
