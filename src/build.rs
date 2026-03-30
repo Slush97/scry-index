@@ -1,5 +1,4 @@
 //! Bulk-load construction for building a learned index from sorted data.
-#![allow(unsafe_code)]
 
 use crate::config::Config;
 use crate::error::{Error, Result};
