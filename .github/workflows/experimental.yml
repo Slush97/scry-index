@@ -13,12 +13,9 @@ jobs:
   sanitizer:
     name: Thread Sanitizer
     runs-on: ubuntu-latest
-    # TSan reports a real-but-benign race between UnsafeCell reads (after
-    # loading state=DATA) and concurrent writes (cas_tombstone_to_data).
-    # Aligned word reads/writes are atomic on x86 and ARM, and all CAS
-    # operations that depend on the read will fail-and-retry if the state
-    # changed. Fixing requires atomic key/value storage or per-slot locks.
-    # See node.rs read_key() safety docs for details.
+    # The TSan race between UnsafeCell reads and cas_tombstone_to_data was
+    # fixed by replacing inline tombstone reuse with child-node attachment
+    # (cas_tombstone_to_child_stale). Inline slot data is now write-once.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

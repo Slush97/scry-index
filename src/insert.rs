@@ -7,7 +7,7 @@
 //! - If the slot contains a different key (`DATA`), clone the existing key+value,
 //!   build a 2-entry conflict child, and CAS `DATA` → `CHILD_STALE`.
 //! - If the slot is `CHILD` or `CHILD_STALE`, follow the child pointer.
-//! - If the slot is `TOMBSTONE`, CAS `TOMBSTONE` → `WRITING` → `DATA` to reuse it.
+//! - If the slot is `TOMBSTONE`, attach a single-entry child (`TOMBSTONE` → `CHILD_STALE`).
 //! - If the slot is `WRITING`, spin (another thread is claiming it).
 //! - On CAS failure, retry from the slot state read.
 #![allow(unsafe_code)]
@@ -105,9 +105,12 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
             }
 
             if state == SLOT_TOMBSTONE {
-                // Reuse a tombstone slot.
-                if current_node.cas_tombstone_to_data(slot_idx, key.clone(), value.clone()) {
-                    current_node.inc_keys();
+                // Attach a child instead of overwriting inline data. Overwriting
+                // would race with concurrent readers who loaded state=DATA before
+                // the DATA→TOMBSTONE transition (UB in the C++ memory model).
+                let child = build_single_entry_child(&key, value.clone());
+                if current_node.cas_tombstone_to_child_stale(slot_idx, child, guard) {
+                    current_node.dec_tombstones();
                     if let Some((parent, pidx, expected)) = descent_snapshot {
                         if parent.load_child(pidx, guard) != expected {
                             retry_was_new = true;
@@ -277,9 +280,10 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
             }
 
             if state == SLOT_TOMBSTONE {
-                // Reuse a tombstone slot.
-                if current_node.cas_tombstone_to_data(slot_idx, key.clone(), value.clone()) {
-                    current_node.inc_keys();
+                // Attach a child instead of overwriting inline data (see insert_inner).
+                let child = build_single_entry_child(&key, value.clone());
+                if current_node.cas_tombstone_to_child_stale(slot_idx, child, guard) {
+                    current_node.dec_tombstones();
                     if let Some((parent, pidx, expected)) = descent_snapshot {
                         if parent.load_child(pidx, guard) != expected {
                             retry_was_new = true;
@@ -291,9 +295,16 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
                             crate::rebuild::try_rebuild_subtree(parent, idx, config, guard);
                         }
                     }
-                    // SAFETY: We just wrote the value. State is DATA.
-                    let val = unsafe { current_node.read_value(slot_idx) };
-                    return (val, InsertResult::Inserted);
+                    // Look up the value we just inserted in the new child.
+                    let child_shared = current_node.load_child(slot_idx, guard);
+                    if !child_shared.is_null() {
+                        // SAFETY: child_shared is the child we just stored.
+                        let child_node = unsafe { child_shared.deref() };
+                        if let Some(val) = crate::lookup::get(child_node, &key, guard) {
+                            return (val, InsertResult::Inserted);
+                        }
+                    }
+                    // Should not happen by construction; loop retries.
                 }
                 // CAS failed, slot changed. Retry.
                 continue;

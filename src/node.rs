@@ -269,13 +269,8 @@ impl<K: Key, V> Node<K, V> {
     ///
     /// Caller must ensure the slot has inline data (state is DATA, `CHILD_STALE`,
     /// or TOMBSTONE) and that the data will not be concurrently modified.
-    ///
-    /// **Known `TSan` report**: A concurrent [`cas_tombstone_to_data`](Self::cas_tombstone_to_data)
-    /// can write to this `UnsafeCell` while a reader that loaded state=`DATA`
-    /// before the `DATA`->`TOMBSTONE` transition is still reading. This is a
-    /// real data race in the C++ memory model but benign on all real hardware
-    /// (aligned word-sized reads/writes are atomic on x86 and ARM). Any CAS
-    /// that depends on the read result will fail and retry if the state changed.
+    /// Inline data is write-once: written during `cas_empty_to_data` and never
+    /// overwritten (tombstone reuse creates a child node instead).
     #[inline]
     pub unsafe fn read_key(&self, idx: usize) -> &K {
         (*self.keys[idx].get()).assume_init_ref()
@@ -286,8 +281,8 @@ impl<K: Key, V> Node<K, V> {
     /// # Safety
     ///
     /// Caller must ensure the slot has inline data (state is DATA) and that
-    /// the data will not be concurrently modified. See [`read_key`](Self::read_key)
-    /// for the known `TSan` race window.
+    /// the data will not be concurrently modified. Inline data is write-once
+    /// (see [`read_key`](Self::read_key)).
     #[inline]
     pub unsafe fn read_value(&self, idx: usize) -> &V {
         (*self.values[idx].get()).assume_init_ref()
@@ -354,11 +349,21 @@ impl<K: Key, V> Node<K, V> {
         true
     }
 
-    /// Atomically claim a TOMBSTONE slot and write new inline key-value data.
+    /// Atomically claim a TOMBSTONE slot and attach a child node.
     ///
-    /// Returns `true` on success. The old stale data is overwritten (safe for
-    /// types without Drop; for Drop types the old data leaks until node rebuild).
-    pub fn cas_tombstone_to_data(&self, idx: usize, key: K, value: V) -> bool {
+    /// Instead of overwriting inline data (which would race with concurrent
+    /// readers — see removed `cas_tombstone_to_data`), the new entry lives in
+    /// a child node and the stale inline data is left untouched. The slot
+    /// transitions to `CHILD_STALE` so drop handles both the stale inline data
+    /// and the child pointer.
+    ///
+    /// Returns `true` on success, `false` if the slot was no longer TOMBSTONE.
+    pub fn cas_tombstone_to_child_stale(
+        &self,
+        idx: usize,
+        child: Self,
+        guard: &Guard,
+    ) -> bool {
         if self.states[idx]
             .compare_exchange(
                 SLOT_TOMBSTONE,
@@ -370,14 +375,10 @@ impl<K: Key, V> Node<K, V> {
         {
             return false;
         }
-        // Overwrite inline storage. The old stale data is not explicitly dropped
-        // here. For Copy types this is fine; for Drop types the old data's
-        // destructor is skipped (acceptable since the node rebuild will reclaim).
-        unsafe {
-            (*self.keys[idx].get()) = MaybeUninit::new(key);
-            (*self.values[idx].get()) = MaybeUninit::new(value);
-        }
-        self.states[idx].store(SLOT_DATA, Ordering::Release);
+        // We own the slot. Store the child pointer (lazily allocates children array).
+        // The stale inline data from the tombstone stays for drop correctness.
+        self.ensure_children()[idx].store(Owned::new(child).into_shared(guard), Ordering::Release);
+        self.states[idx].store(SLOT_CHILD_STALE, Ordering::Release);
         true
     }
 
@@ -432,6 +433,11 @@ impl<K: Key, V> Node<K, V> {
     /// Increment the approximate tombstone count.
     pub fn inc_tombstones(&self) {
         self.num_tombstones.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement the approximate tombstone count.
+    pub fn dec_tombstones(&self) {
+        self.num_tombstones.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Return the approximate ratio of tombstones to total capacity.
