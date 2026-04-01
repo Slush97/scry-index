@@ -1717,10 +1717,13 @@ fn insert_descent_snapshot_retry_under_localized_rebuild() {
     }
     map.rebuild(&guard);
     let g2 = map.guard();
-    assert_eq!(map.len(), 200);
     for i in 0..200u64 {
         assert!(map.get(&i, &g2).is_some(), "key {i} missing");
     }
+    // Use iteration count rather than len() which is approximate under
+    // concurrent rebuilds.
+    let count = map.iter(&g2).count();
+    assert_eq!(count, 200);
 }
 
 /// Low `rebuild_depth_threshold` with `get_or_insert`: exercises the
@@ -1756,8 +1759,11 @@ fn get_or_insert_descent_snapshot_retry() {
     }
     map.rebuild(&guard);
     let g2 = map.guard();
-    assert_eq!(map.len(), 200);
     for i in 0..200u64 {
         assert!(map.get(&i, &g2).is_some(), "key {i} missing");
     }
+    // Use iteration count rather than len() which is approximate under
+    // concurrent rebuilds.
+    let count = map.iter(&g2).count();
+    assert_eq!(count, 200);
 }
