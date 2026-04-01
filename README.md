@@ -75,25 +75,25 @@ for where other structures are a better fit.
 
 ### Point lookups (single-threaded)
 
-| Operation | LearnedMap | BTreeMap | SkipMap | vs BTreeMap | vs SkipMap |
-|---|---|---|---|---|---|
-| Sequential keys | 0.6 ms | 2.8 ms | 4.5 ms | **4.7x faster** | **7.6x faster** |
-| Random keys | 0.9 ms | 5.4 ms | 15.6 ms | **6.2x faster** | **18x faster** |
+| Operation | LearnedMap | BTreeMap | SkipMap |
+|---|---|---|---|
+| Sequential keys | **0.6 ms** | 2.8 ms (4.7x) | 4.5 ms (7.6x) |
+| Random keys | **0.9 ms** | 5.4 ms (6.2x) | 15.6 ms (18x) |
 
 ### Concurrent (100K keys, 8 reader + 4 writer threads)
 
-| Operation | LearnedMap | RwLock\<BTreeMap\> | SkipMap | vs BTreeMap | vs SkipMap |
-|---|---|---|---|---|---|
-| 8T point reads | 1.6 ms | 9.8 ms | 9.2 ms | **6.2x faster** | **5.9x faster** |
-| 4T writes | 1.5 ms | 3.4 ms | 2.3 ms | **2.2x faster** | **1.5x faster** |
-| 8R + 4W mixed | 3.6 ms | 27.3 ms | 11.5 ms | **7.5x faster** | **3.2x faster** |
+| Operation | LearnedMap | RwLock\<BTreeMap\> | SkipMap |
+|---|---|---|---|
+| 8T point reads | **1.6 ms** | 9.8 ms (6.2x) | 9.2 ms (5.9x) |
+| 4T writes | **1.5 ms** | 3.4 ms (2.2x) | 2.3 ms (1.5x) |
+| 8R + 4W mixed | **3.6 ms** | 27.3 ms (7.5x) | 11.5 ms (3.2x) |
 
 ### Writes (single-threaded)
 
-| Operation | LearnedMap | BTreeMap | |
-|---|---|---|---|
-| Incremental insert (10K into 100K) | 0.2 ms | 0.3 ms | **1.5x faster** |
-| Bulk load | 1.4 ms | 0.7 ms | 1.9x slower |
+| Operation | LearnedMap | BTreeMap |
+|---|---|---|
+| Incremental insert (10K into 100K) | **0.2 ms** | 0.3 ms (1.5x) |
+| Bulk load | 1.4 ms | **0.7 ms** (1.9x faster) |
 
 ```sh
 cargo run --example simulate --release      # full 3-way workload comparison
