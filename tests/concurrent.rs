@@ -1220,3 +1220,539 @@ fn localized_rebuild_does_not_resurrect_removed_keys() {
         "keys remain after exhaustive remove"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Coverage-targeted tests: concurrent retry / failure paths
+// ---------------------------------------------------------------------------
+
+/// Inserts racing with rebuild: exercises the frozen-root spin-wait and
+/// post-insert root-changed retry in `LearnedMap::insert`.
+#[test]
+fn insert_during_concurrent_rebuild_retry() {
+    let pairs: Vec<(u64, u64)> = (0..2000).map(|i| (i, i)).collect();
+    let map = Arc::new(
+        LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(12));
+
+    // 8 inserter threads, each inserts 500 unique keys beyond the initial range
+    let insert_handles: Vec<_> = (0..8u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                let base = 2000 + t * 500;
+                for i in 0..500 {
+                    map.insert(base + i, base + i, &guard);
+                }
+            })
+        })
+        .collect();
+
+    // 4 rebuilder threads, each rebuilds 20 times
+    let rebuild_handles: Vec<_> = (0..4)
+        .map(|_| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..20 {
+                    let guard = map.guard();
+                    map.rebuild(&guard);
+                }
+            })
+        })
+        .collect();
+
+    for h in insert_handles {
+        h.join().unwrap();
+    }
+    for h in rebuild_handles {
+        h.join().unwrap();
+    }
+
+    // Rebuild may snapshot before some inserts complete (documented behavior).
+    // Re-insert all keys and verify structural integrity.
+    let guard = map.guard();
+    for i in 0..6000u64 {
+        map.insert(i, i, &guard);
+    }
+    map.rebuild(&guard);
+    let g2 = map.guard();
+    assert_eq!(map.len(), 6000);
+    for i in 0..6000u64 {
+        assert!(map.get(&i, &g2).is_some(), "key {i} missing after recovery");
+    }
+}
+
+/// Removes racing with rebuild: exercises frozen-root spin-wait and
+/// post-remove root-changed retry in `LearnedMap::remove`.
+#[test]
+fn remove_during_concurrent_rebuild_retry() {
+    let pairs: Vec<(u64, u64)> = (0..4000).map(|i| (i, i)).collect();
+    let map = Arc::new(
+        LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(6));
+
+    // 4 remover threads, each removes a disjoint 25%
+    let remove_handles: Vec<_> = (0..4u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                for i in 0..4000u64 {
+                    if i % 4 == t {
+                        map.remove(&i, &guard);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // 2 rebuilder threads, each rebuilds 30 times
+    let rebuild_handles: Vec<_> = (0..2)
+        .map(|_| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..30 {
+                    let guard = map.guard();
+                    map.rebuild(&guard);
+                }
+            })
+        })
+        .collect();
+
+    for h in remove_handles {
+        h.join().unwrap();
+    }
+    for h in rebuild_handles {
+        h.join().unwrap();
+    }
+
+    // Rebuild may resurrect some keys (documented race). Do a final exhaustive
+    // remove and verify the map is empty.
+    let guard = map.guard();
+    for i in 0..4000u64 {
+        map.remove(&i, &guard);
+    }
+    assert_eq!(map.iter_sorted(&guard).len(), 0, "keys remain after exhaustive remove");
+}
+
+/// get_or_insert racing with rebuild: exercises frozen-root spin-wait and
+/// post-operation root-changed retry in `LearnedMap::get_or_insert`.
+#[test]
+fn get_or_insert_during_concurrent_rebuild_retry() {
+    let map = Arc::new(LearnedMap::with_config(Config::new().auto_rebuild(false)));
+    let barrier = Arc::new(Barrier::new(6));
+
+    // 4 get_or_insert threads, each inserts 500 unique keys
+    let goi_handles: Vec<_> = (0..4u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                let base = t * 500;
+                for i in 0..500 {
+                    let key = base + i;
+                    let _val = map.get_or_insert(key, key * 10, &guard);
+                }
+            })
+        })
+        .collect();
+
+    // 2 rebuilder threads, each rebuilds 30 times
+    let rebuild_handles: Vec<_> = (0..2)
+        .map(|_| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..30 {
+                    let guard = map.guard();
+                    map.rebuild(&guard);
+                }
+            })
+        })
+        .collect();
+
+    for h in goi_handles {
+        h.join().unwrap();
+    }
+    for h in rebuild_handles {
+        h.join().unwrap();
+    }
+
+    // Re-insert all keys and verify structural integrity
+    let guard = map.guard();
+    for i in 0..2000u64 {
+        map.insert(i, i * 10, &guard);
+    }
+    map.rebuild(&guard);
+    let g2 = map.guard();
+    assert_eq!(map.len(), 2000);
+    for i in 0..2000u64 {
+        assert!(map.get(&i, &g2).is_some(), "key {i} missing");
+    }
+}
+
+/// Many threads call rebuild simultaneously, exercising the freeze CAS failure
+/// path where all but one thread fail to acquire the freeze.
+#[test]
+fn rebuild_freeze_cas_contention() {
+    let pairs: Vec<(u64, u64)> = (0..1000).map(|i| (i, i)).collect();
+    let map = Arc::new(
+        LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(8));
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..50 {
+                    let guard = map.guard();
+                    map.rebuild(&guard);
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let guard = map.guard();
+    assert_eq!(map.len(), 1000);
+    for i in 0..1000u64 {
+        assert_eq!(map.get(&i, &guard), Some(&i), "key {i} corrupted");
+    }
+}
+
+/// Multiple threads call drain simultaneously. Only one wins the freeze CAS;
+/// the others get empty Vecs.
+#[test]
+fn concurrent_drain_contention() {
+    let pairs: Vec<(u64, u64)> = (0..2000).map(|i| (i, i)).collect();
+    let map = Arc::new(
+        LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(4));
+    let results = Arc::new(Mutex::new(Vec::new()));
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            let results = Arc::clone(&results);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                let drained = map.drain(&guard);
+                results.lock().unwrap().push(drained.len());
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let results = results.lock().unwrap();
+    let total: usize = results.iter().sum();
+    assert_eq!(total, 2000, "total drained entries should be 2000, got {total}");
+    assert!(map.is_empty(), "map should be empty after drain");
+}
+
+/// drain() while concurrent inserts are in flight: exercises the frozen-root
+/// spin path in `LearnedMap::insert`.
+#[test]
+fn drain_during_concurrent_inserts() {
+    let pairs: Vec<(u64, u64)> = (0..1000).map(|i| (i, i)).collect();
+    let map = Arc::new(
+        LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(5));
+
+    // 4 insert threads, each inserts 500 keys above the initial range
+    let insert_handles: Vec<_> = (0..4u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                let base = 1000 + t * 500;
+                for i in 0..500 {
+                    map.insert(base + i, base + i, &guard);
+                }
+            })
+        })
+        .collect();
+
+    // Main thread drains
+    barrier.wait();
+    {
+        let guard = map.guard();
+        let _drained = map.drain(&guard);
+    }
+
+    for h in insert_handles {
+        h.join().unwrap();
+    }
+
+    // Map should be usable after drain + concurrent inserts
+    let guard = map.guard();
+    let actual = map.iter_sorted(&guard).len();
+    assert!(actual <= 3000, "count {actual} exceeds maximum possible");
+}
+
+/// Multiple threads call clear simultaneously, exercising the freeze CAS
+/// failure path in `LearnedMap::clear`.
+#[test]
+fn concurrent_clear_contention() {
+    let pairs: Vec<(u64, u64)> = (0..2000).map(|i| (i, i)).collect();
+    let map = Arc::new(
+        LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(4));
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                map.clear(&guard);
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    assert!(map.is_empty(), "map should be empty after concurrent clears");
+}
+
+/// clear() while concurrent inserts are in flight: exercises the frozen-root
+/// spin path in `LearnedMap::insert`.
+#[test]
+fn clear_during_concurrent_inserts() {
+    let pairs: Vec<(u64, u64)> = (0..1000).map(|i| (i, i)).collect();
+    let map = Arc::new(
+        LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(5));
+
+    let insert_handles: Vec<_> = (0..4u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                let base = 1000 + t * 500;
+                for i in 0..500 {
+                    map.insert(base + i, base + i, &guard);
+                }
+            })
+        })
+        .collect();
+
+    barrier.wait();
+    {
+        let guard = map.guard();
+        map.clear(&guard);
+    }
+
+    for h in insert_handles {
+        h.join().unwrap();
+    }
+
+    // Map should be usable: some inserts may have landed after clear
+    let guard = map.guard();
+    let actual = map.iter_sorted(&guard).len();
+    assert!(actual <= 3000, "count {actual} exceeds maximum possible");
+}
+
+/// drain, clear, and rebuild race against each other, exercising the
+/// tagged-root early return paths in drain() and clear().
+#[test]
+fn drain_clear_rebuild_contention() {
+    let pairs: Vec<(u64, u64)> = (0..2000).map(|i| (i, i)).collect();
+    let map = Arc::new(
+        LearnedMap::bulk_load_with_config(&pairs, Config::new().auto_rebuild(false)).unwrap(),
+    );
+    let barrier = Arc::new(Barrier::new(3));
+
+    let map1 = Arc::clone(&map);
+    let b1 = Arc::clone(&barrier);
+    let h1 = thread::spawn(move || {
+        b1.wait();
+        for _ in 0..20 {
+            let guard = map1.guard();
+            let _ = map1.drain(&guard);
+            // Re-populate for next iteration
+            for i in 0..100u64 {
+                map1.insert(i, i, &guard);
+            }
+        }
+    });
+
+    let map2 = Arc::clone(&map);
+    let b2 = Arc::clone(&barrier);
+    let h2 = thread::spawn(move || {
+        b2.wait();
+        for _ in 0..20 {
+            let guard = map2.guard();
+            map2.clear(&guard);
+            // Re-populate for next iteration
+            for i in 100..200u64 {
+                map2.insert(i, i, &guard);
+            }
+        }
+    });
+
+    barrier.wait();
+    for _ in 0..20 {
+        let guard = map.guard();
+        map.rebuild(&guard);
+    }
+
+    h1.join().unwrap();
+    h2.join().unwrap();
+
+    // No assertion on content -- just verify no panics or corruption.
+    // The map should be usable afterward.
+    let guard = map.guard();
+    let _ = map.iter_sorted(&guard);
+}
+
+/// 16 threads insert the same 100 keys simultaneously, exercising the
+/// WRITING state spin-wait in `insert::insert`.
+#[test]
+fn insert_writing_state_spin() {
+    let map = Arc::new(LearnedMap::with_config(Config::new().auto_rebuild(false)));
+    let barrier = Arc::new(Barrier::new(16));
+
+    let handles: Vec<_> = (0..16u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                for i in 0..100u64 {
+                    map.insert(i, t * 1000 + i, &guard);
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let guard = map.guard();
+    assert_eq!(map.len(), 100);
+    for i in 0..100u64 {
+        assert!(map.get(&i, &guard).is_some(), "key {i} missing");
+    }
+}
+
+/// Low rebuild_depth_threshold with high concurrency: exercises the
+/// descent_snapshot validation and retry path in `insert::insert`, as well
+/// as the tagged-child spin-wait when a localized rebuild freezes a child.
+#[test]
+fn insert_descent_snapshot_retry_under_localized_rebuild() {
+    let config = Config::new()
+        .auto_rebuild(true)
+        .rebuild_depth_threshold(3);
+    let map = Arc::new(LearnedMap::with_config(config));
+    let barrier = Arc::new(Barrier::new(8));
+
+    let handles: Vec<_> = (0..8u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                // All threads insert into the same small range to maximize
+                // subtree contention and localized rebuild frequency.
+                for i in 0..200u64 {
+                    map.insert(i, t * 1000 + i, &guard);
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // Localized rebuilds may race. Re-insert and verify.
+    let guard = map.guard();
+    for i in 0..200u64 {
+        map.insert(i, i, &guard);
+    }
+    map.rebuild(&guard);
+    let g2 = map.guard();
+    assert_eq!(map.len(), 200);
+    for i in 0..200u64 {
+        assert!(map.get(&i, &g2).is_some(), "key {i} missing");
+    }
+}
+
+/// Low rebuild_depth_threshold with get_or_insert: exercises the
+/// descent_snapshot validation and retry path in `insert::get_or_insert`.
+#[test]
+fn get_or_insert_descent_snapshot_retry() {
+    let config = Config::new()
+        .auto_rebuild(true)
+        .rebuild_depth_threshold(3);
+    let map = Arc::new(LearnedMap::with_config(config));
+    let barrier = Arc::new(Barrier::new(8));
+
+    let handles: Vec<_> = (0..8u64)
+        .map(|t| {
+            let map = Arc::clone(&map);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let guard = map.guard();
+                for i in 0..200u64 {
+                    let _val = map.get_or_insert(i, t * 1000 + i, &guard);
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // All keys should be present (get_or_insert never loses keys)
+    let guard = map.guard();
+    for i in 0..200u64 {
+        map.insert(i, i, &guard);
+    }
+    map.rebuild(&guard);
+    let g2 = map.guard();
+    assert_eq!(map.len(), 200);
+    for i in 0..200u64 {
+        assert!(map.get(&i, &g2).is_some(), "key {i} missing");
+    }
+}

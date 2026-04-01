@@ -191,7 +191,8 @@ pub fn insert<K: Key, V: Clone + Send + Sync>(
                 }
 
                 if child_shared.is_null() {
-                    // Should not happen for a CHILD/CHILD_STALE slot, but be safe.
+                    // DEFENSIVE: CHILD/CHILD_STALE slots always have non-null
+                    // child pointers (set by store_child/cas_data_to_child_stale).
                     continue;
                 }
 
@@ -369,6 +370,8 @@ pub fn get_or_insert<'g, K: Key, V: Clone + Send + Sync>(
                 }
 
                 if child_shared.is_null() {
+                    // DEFENSIVE: CHILD/CHILD_STALE slots always have non-null
+                    // child pointers.
                     continue;
                 }
 

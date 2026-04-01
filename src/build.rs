@@ -129,11 +129,13 @@ fn build_degenerate<K: Key, V: Clone>(pairs: &[(K, V)]) -> Node<K, V> {
     let lo_half = &pairs[..mid_idx];
     let hi_half = &pairs[mid_idx..];
 
-    let lo_last_ord = lo_half.last().unwrap().0.to_exact_ordinal();
-    let hi_first_ord = hi_half.first().unwrap().0.to_exact_ordinal();
+    // Both halves are non-empty: the len==1 case returned above, so
+    // len>=2 and mid_idx>=1, giving lo_half at least 1 and hi_half at least 1.
+    let lo_last_ord = lo_half[lo_half.len() - 1].0.to_exact_ordinal();
+    let hi_first_ord = hi_half[0].0.to_exact_ordinal();
 
     let node = if lo_last_ord == hi_first_ord {
-        Node::with_split_key(lo_half.last().unwrap().0.clone(), 2)
+        Node::with_split_key(lo_half[lo_half.len() - 1].0.clone(), 2)
     } else {
         let midpoint = lo_last_ord + (hi_first_ord - lo_last_ord) / 2;
         let model = LinearModel::binary_split(midpoint);

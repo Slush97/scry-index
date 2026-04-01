@@ -512,8 +512,10 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
     /// Atomically get an existing value or insert a computed one.
     ///
     /// Like [`get_or_insert`](Self::get_or_insert), but the value is lazily
-    /// computed by `f` only if the key is absent. If the key is present, `f`
-    /// is never called.
+    /// computed by `f` only if the key is absent during the initial lookup.
+    /// Under concurrent inserts, `f` may be called even if another thread
+    /// inserts the same key first; in that case the computed value is
+    /// discarded and the existing value is returned.
     pub fn get_or_insert_with<'g>(&self, key: K, f: impl FnOnce() -> V, guard: &'g Guard) -> &'g V {
         // Fast path: key already exists.
         if let Some(val) = self.get(&key, guard) {
@@ -678,6 +680,9 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             range_headroom: 1.0,
             ..self.config.clone()
         };
+        // DEFENSIVE: sorted_pairs always produces sorted, non-empty data when
+        // the pairs.is_empty() check above passes. bulk_load only fails on
+        // EmptyData or NotSorted, neither of which can occur here.
         let Ok(new_root) = build::bulk_load(&pairs, &rebuild_config) else {
             // Unfreeze.
             let _ = self.root.compare_exchange(
@@ -716,7 +721,8 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
                 Ordering::Relaxed,
             );
         } else {
-            // CAS failed after freeze. Should not happen, but unfreeze.
+            // DEFENSIVE: CAS on a frozen pointer we own should always succeed
+            // (no other code path modifies a frozen root). Unfreeze as safety net.
             let _ = self.root.compare_exchange(
                 frozen,
                 root_shared,
@@ -778,10 +784,14 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             unsafe {
                 guard.inner.defer_destroy(root_shared);
             }
-            self.len.store(0, Ordering::Relaxed);
+            // Subtract the drained count instead of storing zero. A plain
+            // store(0) would race with concurrent fetch_adds from inserts
+            // landing in the new root between the CAS above and this point.
+            self.len.fetch_sub(pairs.len(), Ordering::Relaxed);
             self.next_root_rebuild
                 .store(INITIAL_ROOT_REBUILD_THRESHOLD, Ordering::Relaxed);
         } else {
+            // DEFENSIVE: CAS on a frozen pointer we own should always succeed.
             let _ = self.root.compare_exchange(
                 frozen,
                 root_shared,
@@ -821,6 +831,12 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             return;
         }
 
+        // Count live entries while the tree is frozen (no concurrent
+        // inserts/removes can proceed). Used for the fetch_sub below.
+        // SAFETY: root is non-null (checked above) and frozen by us.
+        let old_root = unsafe { root_shared.deref() };
+        let entry_count = Iter::new(old_root, &guard.inner).count();
+
         let new_root = Node::with_capacity(LinearModel::new(1.0, 0.0), 64);
         let new_owned = Owned::new(new_root);
         if self
@@ -838,10 +854,14 @@ impl<K: Key, V: Clone + Send + Sync> LearnedMap<K, V> {
             unsafe {
                 guard.inner.defer_destroy(root_shared);
             }
-            self.len.store(0, Ordering::Relaxed);
+            // Subtract the cleared count instead of storing zero. A plain
+            // store(0) would race with concurrent fetch_adds from inserts
+            // landing in the new root between the CAS above and this point.
+            self.len.fetch_sub(entry_count, Ordering::Relaxed);
             self.next_root_rebuild
                 .store(INITIAL_ROOT_REBUILD_THRESHOLD, Ordering::Relaxed);
         } else {
+            // DEFENSIVE: CAS on a frozen pointer we own should always succeed.
             let _ = self.root.compare_exchange(
                 frozen,
                 root_shared,
