@@ -48,10 +48,7 @@ pub struct Wal {
 impl Wal {
     /// Open or create a WAL at the given path.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             path: path.to_path_buf(),
             writer: BufWriter::new(file),

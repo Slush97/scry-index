@@ -1342,7 +1342,11 @@ fn remove_during_concurrent_rebuild_retry() {
     for i in 0..4000u64 {
         map.remove(&i, &guard);
     }
-    assert_eq!(map.iter_sorted(&guard).len(), 0, "keys remain after exhaustive remove");
+    assert_eq!(
+        map.iter_sorted(&guard).len(),
+        0,
+        "keys remain after exhaustive remove"
+    );
 }
 
 /// get_or_insert racing with rebuild: exercises frozen-root spin-wait and
@@ -1470,7 +1474,10 @@ fn concurrent_drain_contention() {
 
     let results = results.lock().unwrap();
     let total: usize = results.iter().sum();
-    assert_eq!(total, 2000, "total drained entries should be 2000, got {total}");
+    assert_eq!(
+        total, 2000,
+        "total drained entries should be 2000, got {total}"
+    );
     assert!(map.is_empty(), "map should be empty after drain");
 }
 
@@ -1543,7 +1550,10 @@ fn concurrent_clear_contention() {
         h.join().unwrap();
     }
 
-    assert!(map.is_empty(), "map should be empty after concurrent clears");
+    assert!(
+        map.is_empty(),
+        "map should be empty after concurrent clears"
+    );
 }
 
 /// clear() while concurrent inserts are in flight: exercises the frozen-root
@@ -1677,9 +1687,7 @@ fn insert_writing_state_spin() {
 /// as the tagged-child spin-wait when a localized rebuild freezes a child.
 #[test]
 fn insert_descent_snapshot_retry_under_localized_rebuild() {
-    let config = Config::new()
-        .auto_rebuild(true)
-        .rebuild_depth_threshold(3);
+    let config = Config::new().auto_rebuild(true).rebuild_depth_threshold(3);
     let map = Arc::new(LearnedMap::with_config(config));
     let barrier = Arc::new(Barrier::new(8));
 
@@ -1720,9 +1728,7 @@ fn insert_descent_snapshot_retry_under_localized_rebuild() {
 /// descent_snapshot validation and retry path in `insert::get_or_insert`.
 #[test]
 fn get_or_insert_descent_snapshot_retry() {
-    let config = Config::new()
-        .auto_rebuild(true)
-        .rebuild_depth_threshold(3);
+    let config = Config::new().auto_rebuild(true).rebuild_depth_threshold(3);
     let map = Arc::new(LearnedMap::with_config(config));
     let barrier = Arc::new(Barrier::new(8));
 

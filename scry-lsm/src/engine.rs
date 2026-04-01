@@ -58,11 +58,7 @@ impl LsmEngine {
     ///
     /// If a WAL exists from a previous run, its records are replayed into the
     /// memtable for crash recovery.
-    pub fn open(
-        dir: &Path,
-        memtable: Box<dyn Memtable>,
-        config: EngineConfig,
-    ) -> Result<Self> {
+    pub fn open(dir: &Path, memtable: Box<dyn Memtable>, config: EngineConfig) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
 
         let wal_path = dir.join("wal.log");
@@ -131,8 +127,7 @@ impl LsmEngine {
 
     /// Delete a key by inserting a tombstone.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        error::lock(&self.wal)?
-            .append_delete(key)?;
+        error::lock(&self.wal)?.append_delete(key)?;
         self.memtable.delete(key);
         Ok(())
     }

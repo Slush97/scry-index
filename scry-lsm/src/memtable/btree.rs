@@ -36,12 +36,19 @@ impl Default for BTreeMemtable {
 impl Memtable for BTreeMemtable {
     fn insert(&self, key: Vec<u8>, value: Vec<u8>) {
         let added_bytes = key.len() + value.len();
-        self.map.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(key, value);
+        self.map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, value);
         self.byte_count.fetch_add(added_bytes, Ordering::Relaxed);
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.map.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(key).cloned()
+        self.map
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .cloned()
     }
 
     fn delete(&self, key: &[u8]) {
@@ -49,7 +56,10 @@ impl Memtable for BTreeMemtable {
     }
 
     fn len(&self) -> usize {
-        self.map.read().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        self.map
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     fn approximate_bytes(&self) -> usize {
@@ -57,7 +67,10 @@ impl Memtable for BTreeMemtable {
     }
 
     fn drain_sorted(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut map = self.map.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let old = std::mem::take(&mut *map);
         self.byte_count.store(0, Ordering::Relaxed);
         old.into_iter().collect()

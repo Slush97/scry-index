@@ -358,12 +358,7 @@ impl<K: Key, V> Node<K, V> {
     /// and the child pointer.
     ///
     /// Returns `true` on success, `false` if the slot was no longer TOMBSTONE.
-    pub fn cas_tombstone_to_child_stale(
-        &self,
-        idx: usize,
-        child: Self,
-        guard: &Guard,
-    ) -> bool {
+    pub fn cas_tombstone_to_child_stale(&self, idx: usize, child: Self, guard: &Guard) -> bool {
         if self.states[idx]
             .compare_exchange(
                 SLOT_TOMBSTONE,

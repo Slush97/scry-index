@@ -109,8 +109,7 @@ impl SsTableWriter {
         self.writer.write_all(&self.block_buf)?;
 
         if let Some(first_key) = self.block_first_key.take() {
-            self.index
-                .push((first_key, self.block_offset, block_len));
+            self.index.push((first_key, self.block_offset, block_len));
         }
 
         self.block_offset += block_len;

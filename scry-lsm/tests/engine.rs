@@ -166,14 +166,8 @@ fn multiple_flushes_and_reads() {
     engine.flush().unwrap();
 
     // Both batches readable.
-    assert_eq!(
-        engine.get(b"a-00050").unwrap(),
-        Some(b"batch1".to_vec())
-    );
-    assert_eq!(
-        engine.get(b"b-00050").unwrap(),
-        Some(b"batch2".to_vec())
-    );
+    assert_eq!(engine.get(b"a-00050").unwrap(), Some(b"batch1".to_vec()));
+    assert_eq!(engine.get(b"b-00050").unwrap(), Some(b"batch2".to_vec()));
 }
 
 // -------------------------------------------------------------------------
@@ -186,10 +180,12 @@ fn ingest_iter_basic() {
     let engine = open_engine(dir.path());
 
     let count = engine
-        .ingest_iter(
-            (0u32..50)
-                .map(|i| (format!("k-{i:04}").into_bytes(), format!("v-{i:04}").into_bytes())),
-        )
+        .ingest_iter((0u32..50).map(|i| {
+            (
+                format!("k-{i:04}").into_bytes(),
+                format!("v-{i:04}").into_bytes(),
+            )
+        }))
         .unwrap();
     assert_eq!(count, 50);
 
@@ -205,9 +201,12 @@ fn ingest_iter_triggers_flush() {
     let engine = open_engine_with_threshold(dir.path(), 200);
 
     let count = engine
-        .ingest_iter(
-            (0u32..100).map(|i| (format!("k-{i:04}").into_bytes(), b"some-value-data".to_vec())),
-        )
+        .ingest_iter((0u32..100).map(|i| {
+            (
+                format!("k-{i:04}").into_bytes(),
+                b"some-value-data".to_vec(),
+            )
+        }))
         .unwrap();
     assert_eq!(count, 100);
 
@@ -245,7 +244,10 @@ fn ingest_reader_skips_malformed_lines() {
     assert_eq!(count, 2); // Only the two valid lines.
 
     assert_eq!(engine.get(b"good").unwrap(), Some(b"data".to_vec()));
-    assert_eq!(engine.get(b"also_good").unwrap(), Some(b"more_data".to_vec()));
+    assert_eq!(
+        engine.get(b"also_good").unwrap(),
+        Some(b"more_data".to_vec())
+    );
 }
 
 #[test]
@@ -254,10 +256,12 @@ fn ingest_sorted_bypasses_memtable() {
     let engine = open_engine(dir.path());
 
     let count = engine
-        .ingest_sorted(
-            (0u32..200)
-                .map(|i| (format!("s-{i:05}").into_bytes(), format!("v-{i:05}").into_bytes())),
-        )
+        .ingest_sorted((0u32..200).map(|i| {
+            (
+                format!("s-{i:05}").into_bytes(),
+                format!("v-{i:05}").into_bytes(),
+            )
+        }))
         .unwrap();
     assert_eq!(count, 200);
 
@@ -287,9 +291,7 @@ fn ingest_sorted_empty_is_noop() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_engine(dir.path());
 
-    let count = engine
-        .ingest_sorted(std::iter::empty())
-        .unwrap();
+    let count = engine.ingest_sorted(std::iter::empty()).unwrap();
     assert_eq!(count, 0);
 }
 
