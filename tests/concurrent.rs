@@ -1349,7 +1349,7 @@ fn remove_during_concurrent_rebuild_retry() {
     );
 }
 
-/// get_or_insert racing with rebuild: exercises frozen-root spin-wait and
+/// `get_or_insert` racing with rebuild: exercises frozen-root spin-wait and
 /// post-operation root-changed retry in `LearnedMap::get_or_insert`.
 #[test]
 fn get_or_insert_during_concurrent_rebuild_retry() {
@@ -1472,8 +1472,7 @@ fn concurrent_drain_contention() {
         h.join().unwrap();
     }
 
-    let results = results.lock().unwrap();
-    let total: usize = results.iter().sum();
+    let total: usize = results.lock().unwrap().iter().sum();
     assert_eq!(
         total, 2000,
         "total drained entries should be 2000, got {total}"
@@ -1481,7 +1480,7 @@ fn concurrent_drain_contention() {
     assert!(map.is_empty(), "map should be empty after drain");
 }
 
-/// drain() while concurrent inserts are in flight: exercises the frozen-root
+/// `drain()` while concurrent inserts are in flight: exercises the frozen-root
 /// spin path in `LearnedMap::insert`.
 #[test]
 fn drain_during_concurrent_inserts() {
@@ -1556,7 +1555,7 @@ fn concurrent_clear_contention() {
     );
 }
 
-/// clear() while concurrent inserts are in flight: exercises the frozen-root
+/// `clear()` while concurrent inserts are in flight: exercises the frozen-root
 /// spin path in `LearnedMap::insert`.
 #[test]
 fn clear_during_concurrent_inserts() {
@@ -1598,7 +1597,7 @@ fn clear_during_concurrent_inserts() {
 }
 
 /// drain, clear, and rebuild race against each other, exercising the
-/// tagged-root early return paths in drain() and clear().
+/// tagged-root early return paths in `drain()` and `clear()`.
 #[test]
 fn drain_clear_rebuild_contention() {
     let pairs: Vec<(u64, u64)> = (0..2000).map(|i| (i, i)).collect();
@@ -1682,8 +1681,8 @@ fn insert_writing_state_spin() {
     }
 }
 
-/// Low rebuild_depth_threshold with high concurrency: exercises the
-/// descent_snapshot validation and retry path in `insert::insert`, as well
+/// Low `rebuild_depth_threshold` with high concurrency: exercises the
+/// `descent_snapshot` validation and retry path in `insert::insert`, as well
 /// as the tagged-child spin-wait when a localized rebuild freezes a child.
 #[test]
 fn insert_descent_snapshot_retry_under_localized_rebuild() {
@@ -1724,8 +1723,8 @@ fn insert_descent_snapshot_retry_under_localized_rebuild() {
     }
 }
 
-/// Low rebuild_depth_threshold with get_or_insert: exercises the
-/// descent_snapshot validation and retry path in `insert::get_or_insert`.
+/// Low `rebuild_depth_threshold` with `get_or_insert`: exercises the
+/// `descent_snapshot` validation and retry path in `insert::get_or_insert`.
 #[test]
 fn get_or_insert_descent_snapshot_retry() {
     let config = Config::new().auto_rebuild(true).rebuild_depth_threshold(3);
