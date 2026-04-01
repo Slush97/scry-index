@@ -1,5 +1,11 @@
 # scry-index
 
+[![Crates.io](https://img.shields.io/crates/v/scry-index)](https://crates.io/crates/scry-index)
+[![docs.rs](https://img.shields.io/docsrs/scry-index)](https://docs.rs/scry-index)
+[![CI](https://github.com/slush97/scry-index/actions/workflows/ci.yml/badge.svg)](https://github.com/slush97/scry-index/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+[![MSRV](https://img.shields.io/badge/MSRV-1.83-orange.svg)](https://www.rust-lang.org)
+
 A concurrent sorted key-value map backed by learned index structures.
 
 Uses piecewise linear models (LIPP chain method) to predict key positions,

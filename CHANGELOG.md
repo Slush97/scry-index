@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.1 — (unreleased)
+
+### Fixed
+
+- TSan race in `read_key`/`cas_tombstone_to_data` inline tombstone reuse path
+- `last_key_value` returning `None` for non-empty maps after removes
+- `drain`/`clear` length counter race under concurrency
+
+### Changed
+
+- Replaced unbounded spin-waits with `crossbeam::utils::Backoff`
+- Removed vestigial `#![allow(unsafe_code)]` from `build.rs`
+
+### Added
+
+- 12 additional coverage tests for concurrent drain/clear paths
+
 ## 0.1.0 — 2026-03-26
 
 Initial release.
